@@ -4,7 +4,7 @@ import { prisma } from './db/index.js';
 
 async function main(): Promise<void> {
   const env = loadEnv();
-  const app = await buildApp({ env });
+  const app = await buildApp({ env, startWebhookWorker: true });
 
   const shutdown = async (signal: string) => {
     app.log.info({ signal }, 'shutting down');
