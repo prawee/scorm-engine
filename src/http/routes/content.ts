@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyPluginAsync, FastifyRequest } from 'fastify';
 
 import type { PrismaClient } from '../../db/client.js';
+import { isTenantKey } from '../../storage/scoped.js';
 import { type StorageAdapter, StorageNotFoundError } from '../../storage/types.js';
 import { extractToken } from '../../auth/attempt-token.js';
 
@@ -46,6 +47,10 @@ export function contentRoutes(deps: ContentRouteDeps): FastifyPluginAsync {
           return reply.code(404).send({ code: 'course_not_found', message: 'Course not found' });
         }
 
+        if (!isTenantKey(tenantId, course.storageKey)) {
+          req.log.error({ storageKey: course.storageKey }, 'course storage key is outside its tenant prefix');
+          return reply.code(404).send({ code: 'course_not_found', message: 'Course not found' });
+        }
         const key = `${course.storageKey}/${relPath}`;
         try {
           const stream = await storage.get(key);
@@ -111,7 +116,7 @@ const CONTENT_TYPES: Record<string, string> = {
   txt: 'text/plain; charset=utf-8',
 };
 
-function contentTypeFor(path: string): string {
+export function contentTypeFor(path: string): string {
   const dot = path.lastIndexOf('.');
   const ext = dot === -1 ? '' : path.slice(dot + 1).toLowerCase();
   return CONTENT_TYPES[ext] ?? 'application/octet-stream';

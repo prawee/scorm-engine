@@ -9,6 +9,7 @@ import {
   type ParsedManifest,
   type ScormVersion as ManifestScormVersion,
 } from '../parser/index.js';
+import { tenantKey } from '../storage/scoped.js';
 import type { StorageAdapter } from '../storage/types.js';
 
 export class CourseServiceError extends Error {
@@ -76,7 +77,7 @@ export async function createCourseFromUpload(
   const { prisma, storage } = deps;
 
   const courseId = randomUUID();
-  const storagePrefix = `tenants/${tenantId}/courses/${courseId}`;
+  const storagePrefix = tenantKey(tenantId, 'courses', courseId);
 
   let ingest;
   try {
