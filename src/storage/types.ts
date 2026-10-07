@@ -8,6 +8,8 @@ export interface StorageAdapter {
   signedUrl(key: string, ttlSeconds: number): Promise<string>;
   /** Storage-backend-native absolute path for a key. Useful for local-disk static serving. */
   resolve?(key: string): string;
+  /** Readiness probe: resolves when the backend is reachable and usable, throws otherwise. */
+  check?(): Promise<void>;
 }
 
 export class StorageNotFoundError extends Error {

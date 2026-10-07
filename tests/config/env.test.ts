@@ -33,6 +33,20 @@ describe('loadEnv', () => {
     expect(env.JWT_ATTEMPT_TTL_SECONDS).toBe(900);
   });
 
+  it('reads boolean flags the way people spell them in a .env', () => {
+    expect(loadEnv({ ...baseEnv, XAPI_REQUIRE_PRECONDITIONS: 'false' }).XAPI_REQUIRE_PRECONDITIONS)
+      .toBe(false);
+    resetEnvForTests();
+    expect(loadEnv({ ...baseEnv, XAPI_REQUIRE_PRECONDITIONS: 'TRUE' }).XAPI_REQUIRE_PRECONDITIONS)
+      .toBe(true);
+    resetEnvForTests();
+    expect(loadEnv({ ...baseEnv, S3_FORCE_PATH_STYLE: 'no' }).S3_FORCE_PATH_STYLE).toBe(false);
+  });
+
+  it('defaults the LRS authority home page', () => {
+    expect(loadEnv(baseEnv).XAPI_AUTHORITY_HOMEPAGE).toBe('https://scormflow.dev/lrs');
+  });
+
   it('caches the parsed env across calls', () => {
     const a = loadEnv(baseEnv);
     const b = loadEnv({ ...baseEnv, PORT: '9999' });
@@ -103,6 +117,21 @@ describe('loadEnv — S3 storage driver', () => {
 
   it('does not require S3 fields when driver is local', () => {
     expect(() => loadEnv({ ...baseEnv, STORAGE_DRIVER: 'local' })).not.toThrow();
+  });
+
+  it('treats blank S3 values (as .env.example ships them) as unset', () => {
+    const blank = {
+      S3_ENDPOINT: '',
+      S3_REGION: '',
+      S3_BUCKET: '',
+      S3_ACCESS_KEY_ID: '',
+      S3_SECRET_ACCESS_KEY: '',
+      S3_SESSION_TOKEN: '',
+    };
+    const env = loadEnv({ ...baseEnv, STORAGE_DRIVER: 'local', ...blank });
+    expect(env.S3_ENDPOINT).toBeUndefined();
+    resetEnvForTests();
+    expect(() => loadEnv({ ...baseEnv, STORAGE_DRIVER: 's3', ...blank })).toThrow(/S3_BUCKET is required/);
   });
 });
 

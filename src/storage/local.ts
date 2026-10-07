@@ -1,5 +1,5 @@
-import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdir, rm, stat } from 'node:fs/promises';
+import { constants, createReadStream, createWriteStream } from 'node:fs';
+import { access, mkdir, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
@@ -52,6 +52,12 @@ export class LocalStorage implements StorageAdapter {
     } catch {
       return false;
     }
+  }
+
+  /** Readiness probe: the root directory exists (or can be created) and is writable. */
+  async check(): Promise<void> {
+    await mkdir(this.#rootDir, { recursive: true });
+    await access(this.#rootDir, constants.R_OK | constants.W_OK);
   }
 
   async signedUrl(key: string, _ttlSeconds: number): Promise<string> {

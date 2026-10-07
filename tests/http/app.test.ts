@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../../src/http/app.js';
+import type { PrismaClient } from '../../src/db/client.js';
 import { createTestEnv } from '../helpers/test-env.js';
+import { MemoryStorage } from '../helpers/memory-storage.js';
 
 describe('buildApp', () => {
   let app: FastifyInstance;
@@ -16,21 +18,58 @@ describe('buildApp', () => {
   });
 
   describe('health endpoints', () => {
-    it('GET /healthz returns 200 with { status: "ok" }', async () => {
+    it('GET /healthz returns 200 with status and version', async () => {
       const res = await app.inject({ method: 'GET', url: '/healthz' });
       expect(res.statusCode).toBe(200);
-      expect(res.json()).toEqual({ status: 'ok' });
+      expect(res.json()).toEqual({ status: 'ok', version: expect.any(String) });
     });
 
-    it('GET /readyz returns 200 with { status: "ready" }', async () => {
-      const res = await app.inject({ method: 'GET', url: '/readyz' });
-      expect(res.statusCode).toBe(200);
-      expect(res.json()).toEqual({ status: 'ready' });
+    it('serves /health and /ready inside the versioned API too', async () => {
+      expect((await app.inject({ method: 'GET', url: '/api/v1/health' })).json()).toMatchObject({ status: 'ok' });
+      expect((await app.inject({ method: 'GET', url: '/api/v1/ready' })).statusCode).not.toBe(404);
+      expect((await app.inject({ method: 'GET', url: '/api/v1/healthz' })).statusCode).toBe(404);
+    });
+  });
+
+  describe('readiness', () => {
+    async function readiness(deps: { db: () => Promise<unknown>; storage?: () => Promise<void> }) {
+      const storage = new MemoryStorage();
+      if (deps.storage) Object.assign(storage, { check: deps.storage });
+      const prisma = { $queryRaw: deps.db } as unknown as PrismaClient;
+      const probe = await buildApp({ env: createTestEnv(), prisma, storage });
+      try {
+        const [root, api] = await Promise.all([
+          probe.inject({ method: 'GET', url: '/readyz' }),
+          probe.inject({ method: 'GET', url: '/api/v1/ready' }),
+        ]);
+        expect(api.statusCode).toBe(root.statusCode);
+        expect(api.json()).toEqual(root.json());
+        return { status: root.statusCode, body: root.json() };
+      } finally {
+        await probe.close();
+      }
+    }
+
+    it('reports ready when the database and storage respond', async () => {
+      const res = await readiness({ db: async () => [{ '?column?': 1 }], storage: async () => undefined });
+      expect(res).toEqual({ status: 200, body: { status: 'ready', checks: { database: 'ok', storage: 'ok' } } });
     });
 
-    it('health endpoints are not under the /api/v1 prefix', async () => {
-      const res = await app.inject({ method: 'GET', url: '/api/v1/healthz' });
-      expect(res.statusCode).toBe(404);
+    it('returns 503 and names the failing dependency', async () => {
+      const res = await readiness({
+        db: async () => [],
+        storage: async () => {
+          throw new Error('bucket gone');
+        },
+      });
+      expect(res).toEqual({ status: 503, body: { status: 'not_ready', checks: { database: 'ok', storage: 'error' } } });
+    });
+
+    it('reports a failing database without leaking error details', async () => {
+      const res = await readiness({ db: () => Promise.reject(new Error('password authentication failed')) });
+      expect(res.status).toBe(503);
+      expect(res.body.checks.database).toBe('error');
+      expect(JSON.stringify(res.body)).not.toContain('password');
     });
   });
 
