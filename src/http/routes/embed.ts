@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyPluginAsync } from 'fastify';
 
 import type { PrismaClient } from '../../db/client.js';
 import type { Env } from '../../config/env.js';
-import { getRuntimeState } from '../../tracking/index.js';
+import { getRuntimeState, type RuntimeState } from '../../tracking/index.js';
 import { ATTEMPT_COOKIE } from '../../auth/attempt-token.js';
 import { renderPlayerPage, renderRuntimeBridge } from '../runtime-bridge.js';
 
@@ -115,7 +115,7 @@ export function embedRoutes(deps: EmbedRouteDeps): FastifyPluginAsync {
           attemptId: req.params.attemptId,
           token,
           version: state.version,
-          cmi: state.cmi,
+          cmi: withLaunchContext(state),
           contentUrl,
           theme: req.query.theme ?? 'auto',
         });
@@ -157,6 +157,28 @@ export function embedRoutes(deps: EmbedRouteDeps): FastifyPluginAsync {
     }
     return `/api/v1/courses/${encodeURIComponent(attempt.courseId)}/content/${launchHref}`;
   }
+}
+
+/**
+ * The bridge answers GetValue from the seeded CMI alone, so fold in the
+ * read-only launch elements the engine owns — content checks `entry` to decide
+ * whether to restore its location and suspend_data.
+ */
+function withLaunchContext(state: RuntimeState): Record<string, string> {
+  const name = state.learner.name ?? state.learner.id;
+  const launch =
+    state.version === 'SCORM_1_2'
+      ? {
+          'cmi.core.entry': state.entry,
+          'cmi.core.student_id': state.learner.id,
+          'cmi.core.student_name': name,
+        }
+      : {
+          'cmi.entry': state.entry,
+          'cmi.learner_id': state.learner.id,
+          'cmi.learner_name': name,
+        };
+  return { ...state.cmi, ...launch };
 }
 
 function clampTtl(requested: number | undefined, fallback: number): number {

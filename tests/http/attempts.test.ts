@@ -6,6 +6,7 @@ import type { PrismaClient } from '../../src/db/client.js';
 import { hashApiKey } from '../../src/auth/api-key.js';
 import { createTestEnv } from '../helpers/test-env.js';
 import { MemoryStorage } from '../helpers/memory-storage.js';
+import type { WebhookDispatcher } from '../../src/webhooks/index.js';
 
 const TENANT = 'tenant_test';
 const API_KEY = 'sk_test_attempts';
@@ -33,7 +34,8 @@ function attemptsPrisma() {
     for (const key of Object.keys(select)) {
       const spec = select[key];
       if (spec && typeof spec === 'object' && spec.select) {
-        out[key] = row[key] ? pick(row[key], spec.select) : null;
+        const rel = row[key];
+        out[key] = Array.isArray(rel) ? rel.map((r) => pick(r, spec.select)) : rel ? pick(rel, spec.select) : null;
       } else {
         out[key] = row[key];
       }
@@ -45,6 +47,7 @@ function attemptsPrisma() {
     ...a,
     course,
     learner: db.learners.find((l) => l.id === a.learnerId) ?? null,
+    objectives: db.objectives.filter((o) => o.attemptId === a.id),
   });
 
   const client = {
@@ -331,6 +334,76 @@ describe('attempts runtime routes', () => {
     expect(res.json().entry).toBe('resume');
     expect(res.json().cmi['cmi.location']).toBe('page-2');
   });
+
+  it('suspends on terminate with exit=suspend and resumes the same attempt', async () => {
+    const attemptId = (await start({ learnerId: 'u1' })).json().attemptId;
+    const suspend = await app.inject({
+      method: 'POST',
+      url: `/api/v1/attempts/${attemptId}/commit`,
+      headers: auth,
+      payload: {
+        values: {
+          'cmi.location': 'page-3',
+          'cmi.suspend_data': 'bookmark=3',
+          'cmi.exit': 'suspend',
+          'cmi.session_time': 'PT2M',
+        },
+        terminate: true,
+      },
+    });
+    expect(suspend.statusCode).toBe(200);
+    expect(suspend.json()).toMatchObject({ terminated: false, suspended: true });
+
+    const row = harness.db.attempts[0];
+    expect(row.status).toBe('IN_PROGRESS');
+    expect(row.finishedAt).toBeNull();
+    expect(row.suspendData).toBe('bookmark=3');
+    expect(row.sessionTimeSeconds).toBe(120);
+    // The next session starts clean, with the suspended time banked.
+    expect(row.cmiSnapshot['cmi.exit']).toBeUndefined();
+    expect(row.cmiSnapshot['cmi.session_time']).toBeUndefined();
+    expect(row.cmiSnapshot['cmi.total_time']).toBe('PT2M');
+
+    const resumed = await start({ learnerId: 'u1' });
+    expect(resumed.statusCode).toBe(200);
+    expect(resumed.json()).toMatchObject({ attemptId, resumed: true, entry: 'resume' });
+    expect(resumed.json().launch.totalTime).toBe('PT2M');
+    expect(resumed.json().cmi['cmi.suspend_data']).toBe('bookmark=3');
+
+    // Second session: its own session_time adds to the bank, re-commits don't double count.
+    for (const t of ['PT1M', 'PT3M']) {
+      await app.inject({
+        method: 'POST',
+        url: `/api/v1/attempts/${attemptId}/commit`,
+        headers: auth,
+        payload: { values: { 'cmi.session_time': t } },
+      });
+    }
+    expect(harness.db.attempts[0].sessionTimeSeconds).toBe(300);
+
+    const done = await app.inject({
+      method: 'POST',
+      url: `/api/v1/attempts/${attemptId}/commit`,
+      headers: auth,
+      payload: { values: { 'cmi.completion_status': 'completed', 'cmi.exit': 'normal' }, terminate: true },
+    });
+    expect(done.json()).toMatchObject({ terminated: true, suspended: false });
+    expect(harness.db.attempts[0].status).toBe('COMPLETED');
+    expect(harness.db.attempts[0].sessionTimeSeconds).toBe(300);
+  });
+
+  it('ignores content writes to the engine-owned total_time', async () => {
+    const attemptId = (await start({ learnerId: 'u1' })).json().attemptId;
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/v1/attempts/${attemptId}/commit`,
+      headers: auth,
+      payload: { values: { 'cmi.total_time': 'PT99H', 'cmi.session_time': 'PT1M' } },
+    });
+    expect(res.json().warnings[0].element).toBe('cmi.total_time');
+    expect(harness.db.attempts[0].cmiSnapshot['cmi.total_time']).toBeUndefined();
+    expect(harness.db.attempts[0].sessionTimeSeconds).toBe(60);
+  });
 });
 
 describe('attempts runtime routes (strict validation mode)', () => {
@@ -382,5 +455,119 @@ describe('attempts runtime routes (strict validation mode)', () => {
     // never the rejected "banana").
     expect(harness.db.attempts[0].scoreScaled).toBe(0.5);
     expect(harness.db.attempts[0].cmiSnapshot['cmi.completion_status']).not.toBe('banana');
+  });
+});
+
+describe('attempts runtime routes (webhook events)', () => {
+  let app: FastifyInstance;
+  const auth = { 'x-api-key': API_KEY };
+  let events: Array<{ tenantId: string; type: string; data: Record<string, any> }>;
+
+  beforeEach(async () => {
+    events = [];
+    const spy = {
+      emit: (tenantId: string, type: string, data: Record<string, any>) => events.push({ tenantId, type, data }),
+      start: () => undefined,
+      stop: async () => undefined,
+    } as unknown as WebhookDispatcher;
+    app = await buildApp({
+      env: createTestEnv(),
+      prisma: attemptsPrisma().prisma,
+      storage: new MemoryStorage(),
+      webhooks: spy,
+    });
+    await app.ready();
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  const startAttempt = () =>
+    app.inject({
+      method: 'POST',
+      url: `/api/v1/courses/${COURSE_ID}/attempts`,
+      payload: { learnerId: 'u1' },
+      headers: auth,
+    });
+
+  const commit = (attemptId: string, values: Record<string, string>, terminate = false) =>
+    app.inject({
+      method: 'POST',
+      url: `/api/v1/attempts/${attemptId}/commit`,
+      headers: auth,
+      payload: { values, terminate },
+    });
+
+  it('reports attempt starts and progress transitions, once each', async () => {
+    const attemptId = (await startAttempt()).json().attemptId;
+    expect(events).toEqual([
+      {
+        tenantId: TENANT,
+        type: 'attempt.started',
+        data: { attemptId, courseId: COURSE_ID, scoId: null, learnerId: 'u1' },
+      },
+    ]);
+
+    // Resuming does not start a new attempt.
+    await startAttempt();
+    expect(events).toHaveLength(1);
+
+    await commit(attemptId, { 'cmi.success_status': 'failed', 'cmi.score.scaled': '0.4' });
+    expect(events.slice(1).map((e) => e.type)).toEqual(['course.failed', 'score.updated']);
+    expect(events[2]!.data).toMatchObject({ attemptId, learnerId: 'u1', score: { scaled: 0.4 } });
+
+    // Same state again: nothing new.
+    await commit(attemptId, { 'cmi.success_status': 'failed', 'cmi.score.scaled': '0.4' });
+    expect(events).toHaveLength(3);
+
+    await commit(
+      attemptId,
+      { 'cmi.completion_status': 'completed', 'cmi.success_status': 'passed', 'cmi.score.scaled': '0.9' },
+      true,
+    );
+    expect(events.slice(3).map((e) => e.type)).toEqual([
+      'course.completed',
+      'course.passed',
+      'score.updated',
+      'attempt.terminated',
+    ]);
+    expect(events.at(-1)!.data).toMatchObject({ completionStatus: 'COMPLETED', successStatus: 'PASSED' });
+  });
+
+  it('reports each objective the first time it is mastered', async () => {
+    const attemptId = (await startAttempt()).json().attemptId;
+    events.length = 0;
+
+    await commit(attemptId, {
+      'cmi.objectives.0.id': 'obj-a',
+      'cmi.objectives.0.success_status': 'failed',
+      'cmi.objectives.1.id': 'obj-b',
+      'cmi.objectives.1.success_status': 'passed',
+      'cmi.objectives.1.score.scaled': '0.95',
+    });
+    const mastered = () => events.filter((e) => e.type === 'objective.mastered');
+    expect(mastered()).toHaveLength(1);
+    expect(mastered()[0]!.data).toMatchObject({
+      attemptId,
+      courseId: COURSE_ID,
+      learnerId: 'u1',
+      objective: { id: 'obj-b', index: 1, successStatus: 'PASSED', score: { scaled: 0.95 } },
+    });
+
+    // obj-b stays passed (silent); obj-a flips to passed (fires).
+    await commit(attemptId, { 'cmi.objectives.0.success_status': 'passed' });
+    expect(mastered().map((e) => e.data.objective.id)).toEqual(['obj-b', 'obj-a']);
+
+    await commit(attemptId, { 'cmi.objectives.0.score.raw': '10' });
+    expect(mastered()).toHaveLength(2);
+  });
+
+  it('reports a suspend as attempt.suspended, not attempt.terminated', async () => {
+    const attemptId = (await startAttempt()).json().attemptId;
+    events.length = 0;
+    await commit(attemptId, { 'cmi.exit': 'suspend', 'cmi.location': 'p2' }, true);
+    expect(events.map((e) => e.type)).toEqual(['attempt.suspended']);
+    expect(events[0]!.data).toMatchObject({ attemptId, learnerId: 'u1' });
   });
 });
