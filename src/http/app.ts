@@ -16,11 +16,34 @@ import { attemptsRoutes } from './routes/attempts.js';
 import { analyticsRoutes } from './routes/analytics.js';
 import { contentRoutes } from './routes/content.js';
 import { embedRoutes } from './routes/embed.js';
+import { xapiRoutes } from './routes/xapi.js';
+import { cmi5Routes } from './routes/cmi5.js';
+import { webhookRoutes } from './routes/webhooks.js';
+import { WebhookDispatcher } from '../webhooks/index.js';
+import { TenantRateLimiter, tenantRateLimit } from './rate-limit.js';
+import { registerHealthRoutes } from './health.js';
+import { ENGINE_VERSION } from '../version.js';
+
+declare module 'fastify' {
+  interface FastifyInstance {
+    /** Publishes engine events to the tenant's webhook endpoints. */
+    webhooks: WebhookDispatcher;
+  }
+}
 
 export interface AppDeps {
   env: Env;
   prisma?: PrismaClient;
   storage?: StorageAdapter;
+  /** Supply a dispatcher (e.g. one with a stubbed `fetch`); one is built from `env` otherwise. */
+  webhooks?: WebhookDispatcher;
+  /**
+   * Poll for due webhook retries every `WEBHOOK_WORKER_INTERVAL_MS`. The server
+   * entrypoint turns this on; embedders and tests opt in.
+   */
+  startWebhookWorker?: boolean;
+  /** Supply a limiter (e.g. with per-tenant `limitFor` overrides); one is built from `RATE_LIMIT_*` otherwise. */
+  rateLimiter?: TenantRateLimiter;
 }
 
 export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
@@ -47,20 +70,42 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   });
   await app.register(jwt, { secret: env.JWT_SECRET });
 
+  const webhooks =
+    deps.webhooks ??
+    new WebhookDispatcher({
+      prisma,
+      maxAttempts: env.WEBHOOK_MAX_ATTEMPTS,
+      retryBaseSeconds: env.WEBHOOK_RETRY_BASE_SECONDS,
+      timeoutMs: env.WEBHOOK_TIMEOUT_MS,
+      logger: app.log,
+    });
+  app.decorate('webhooks', webhooks);
+  if (deps.startWebhookWorker) webhooks.start(env.WEBHOOK_WORKER_INTERVAL_MS);
+  app.addHook('onClose', async () => webhooks.stop());
+
   await app.register(apiKeyAuth, { prisma });
   await app.register(attemptAuth);
+  await app.register(tenantRateLimit, {
+    limiter:
+      deps.rateLimiter ??
+      new TenantRateLimiter({ max: env.RATE_LIMIT_MAX, windowSeconds: env.RATE_LIMIT_WINDOW_SECONDS }),
+  });
 
-  app.get('/healthz', async () => ({ status: 'ok' }));
-  app.get('/readyz', async () => ({ status: 'ready' }));
+  const health = { prisma, storage, version: ENGINE_VERSION };
+  registerHealthRoutes(app, health, { health: '/healthz', ready: '/readyz' });
 
   await app.register(
     async (api) => {
+      registerHealthRoutes(api, health, { health: '/health', ready: '/ready' });
       await api.register(registerRoutes);
       await api.register(coursesRoutes({ prisma, storage }), { prefix: '/courses' });
       await api.register(contentRoutes({ prisma, storage }));
-      await api.register(attemptsRoutes({ prisma, validationMode: env.SCORM_VALIDATION_MODE }));
+      await api.register(attemptsRoutes({ prisma, validationMode: env.SCORM_VALIDATION_MODE, events: webhooks }));
       await api.register(analyticsRoutes({ prisma }), { prefix: '/analytics' });
       await api.register(embedRoutes({ prisma, env }));
+      await api.register(xapiRoutes({ prisma, storage, env, events: webhooks }), { prefix: '/xapi' });
+      await api.register(cmi5Routes({ prisma, storage, env, events: webhooks }), { prefix: '/cmi5' });
+      await api.register(webhookRoutes({ prisma, env, dispatcher: webhooks }), { prefix: '/webhooks' });
     },
     { prefix: '/api/v1' },
   );
