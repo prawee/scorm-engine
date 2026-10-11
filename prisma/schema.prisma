@@ -13,10 +13,18 @@ model Tenant {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  apiKeys  ApiKey[]
-  courses  Course[]
-  learners Learner[]
-  attempts Attempt[]
+  apiKeys        ApiKey[]
+  courses        Course[]
+  learners       Learner[]
+  attempts       Attempt[]
+  xapiStatements XapiStatement[]
+  xapiStates     XapiState[]
+  xapiProfiles   XapiProfile[]
+  cmi5Courses    Cmi5Course[]
+  cmi5Regs       Cmi5Registration[]
+  cmi5Sessions   Cmi5Session[]
+  webhookEndpoints  WebhookEndpoint[]
+  webhookDeliveries WebhookDelivery[]
 }
 
 model ApiKey {
@@ -152,6 +160,10 @@ model Attempt {
   lastCommitAt DateTime?
   finishedAt   DateTime?
 
+  /// Highest client commit sequence number applied (offline sync). Commits
+  /// carrying a `seq` at or below this are acknowledged without re-applying.
+  lastCommitSeq Int?
+
   tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   course       Course        @relation(fields: [courseId], references: [id], onDelete: Cascade)
   learner      Learner       @relation(fields: [learnerId], references: [id], onDelete: Cascade)
@@ -210,10 +222,300 @@ model CommitLog {
   id        String   @id @default(cuid())
   attemptId String
   values    Json
-  createdAt DateTime @default(now())
+  /// Client sequence number for offline-synced commits; null for live commits.
+  seq        Int?
+  /// When the client recorded the commit (offline sync), if it said so.
+  recordedAt DateTime?
+  createdAt  DateTime @default(now())
 
   attempt Attempt @relation(fields: [attemptId], references: [id], onDelete: Cascade)
 
   @@index([attemptId])
   @@index([createdAt])
+}
+
+/// A stored xAPI 1.0.3 statement. The authoritative document lives in `statement`
+/// (JSON, exactly as the LRS returns it); the scalar columns alongside it are
+/// denormalized copies of the fields the Statement query filters match on.
+model XapiStatement {
+  tenantId    String
+  statementId String
+
+  /// Canonical inverse-functional identifier for the actor, e.g. `mbox:mailto:a@b.c`.
+  actorIfi     String
+  verbId       String
+  /// `Activity` | `Agent` | `Group` | `StatementRef` | `SubStatement`.
+  objectType   String
+  /// Activity IRI, actor IFI, or referenced statement id — whatever identifies the object.
+  objectId     String?
+  registration String?
+
+  /// Every activity IRI the statement touches (object + context activities), for
+  /// `related_activities=true` queries.
+  relatedActivities String[]
+  /// Every actor IFI the statement touches (actor, object, instructor, team,
+  /// authority), for `related_agents=true` queries.
+  relatedAgents String[]
+
+  /// True once a `voided` statement has targeted this one. Voided statements are
+  /// excluded from normal queries but stay retrievable by id.
+  voided           Boolean @default(false)
+  /// Set on a voiding statement: the id of the statement it voids.
+  voidsStatementId String?
+
+  statement Json
+  timestamp DateTime
+  stored    DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@id([tenantId, statementId])
+  @@index([tenantId, stored])
+  @@index([tenantId, actorIfi])
+  @@index([tenantId, verbId])
+  @@index([tenantId, objectId])
+  @@index([tenantId, registration])
+  @@index([tenantId, voidsStatementId])
+}
+
+/// An xAPI State API document, keyed by (activity, agent, registration, stateId).
+/// `lookupKey` hashes that tuple so the unique index stays inside Postgres' btree
+/// key limit even for long activity IRIs.
+model XapiState {
+  id        String @id @default(cuid())
+  tenantId  String
+  lookupKey String
+
+  activityId   String
+  agentIfi     String
+  registration String?
+  stateId      String
+
+  contentType String @default("application/json")
+  content     Bytes
+  etag        String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, lookupKey])
+  @@index([tenantId, activityId, agentIfi])
+  @@index([tenantId, updatedAt])
+}
+
+/// Which of the two Profile resources a document belongs to.
+enum XapiProfileScope {
+  ACTIVITY
+  AGENT
+}
+
+/// An xAPI Activity Profile or Agent Profile document.
+///
+/// Both resources have identical document semantics and differ only in what
+/// identifies the owner — an activity IRI or an agent IFI — so they share one
+/// table with a `scope` discriminator. Exactly one of `activityId` / `agentIfi`
+/// is set for any row. As with XapiState, `lookupKey` hashes the owning tuple so
+/// the unique index stays inside Postgres' btree key limit.
+model XapiProfile {
+  id        String           @id @default(cuid())
+  tenantId  String
+  scope     XapiProfileScope
+  lookupKey String
+
+  activityId String?
+  agentIfi   String?
+  profileId  String
+
+  contentType String @default("application/json")
+  content     Bytes
+  etag        String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, lookupKey])
+  @@index([tenantId, scope, activityId])
+  @@index([tenantId, scope, agentIfi])
+  @@index([tenantId, updatedAt])
+}
+
+/// A cmi5 course, imported from a `cmi5.xml` course structure. Kept apart from
+/// `Course` because a cmi5 course is driven entirely through the LRS — it has no
+/// SCORM runtime, CMI snapshot, or SCO launch semantics.
+model Cmi5Course {
+  id          String   @id @default(cuid())
+  tenantId    String
+  /// The course `id` from the course structure (the publisher's IRI).
+  publisherId String
+  /// LMS-generated activity IRI the engine uses as the object of course-level
+  /// statements (`satisfied`).
+  activityId  String
+  title       String
+  description String?
+  /// Storage prefix of the extracted package, or null for a structure-only
+  /// import whose AUs are all hosted elsewhere.
+  storageKey  String?
+  /// Parsed course structure (blocks + AU ids), as returned by the parser.
+  structure   Json
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant        Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  aus           Cmi5Au[]
+  registrations Cmi5Registration[]
+
+  @@index([tenantId])
+}
+
+/// One Assignable Unit of a cmi5 course.
+model Cmi5Au {
+  id               String  @id @default(cuid())
+  courseId         String
+  /// The AU `id` from the course structure; sent as the `publisherid` grouping activity.
+  publisherId      String
+  /// LMS-generated activity IRI — the `activityId` launch parameter and the
+  /// object of every cmi5 defined statement for this AU.
+  activityId       String
+  title            String
+  description      String?
+  url              String
+  /// `AnyWindow` | `OwnWindow`.
+  launchMethod     String  @default("AnyWindow")
+  /// `Passed` | `Completed` | `CompletedAndPassed` | `CompletedOrPassed` | `NotApplicable`.
+  moveOn           String  @default("NotApplicable")
+  masteryScore     Float?
+  activityType     String?
+  launchParameters String?
+  entitlementKey   String?
+  order            Int
+
+  course   Cmi5Course    @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  sessions Cmi5Session[]
+
+  @@unique([courseId, publisherId])
+  @@index([courseId])
+}
+
+/// A learner's enrolment in a cmi5 course. `id` is the xAPI `registration` UUID.
+model Cmi5Registration {
+  id          String    @id
+  tenantId    String
+  courseId    String
+  actor       Json
+  actorIfi    String
+  /// Per-AU progress keyed by AU publisher id:
+  /// `{ completed, passed, failed, waived, satisfied }`.
+  auState     Json      @default("{}")
+  /// Blocks the learner has satisfied, keyed by block publisher id → ISO time
+  /// the engine recorded the block's `satisfied` statement.
+  blockState  Json      @default("{}")
+  satisfiedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  tenant   Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  course   Cmi5Course    @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  sessions Cmi5Session[]
+
+  @@index([tenantId, courseId, actorIfi])
+}
+
+enum Cmi5SessionStatus {
+  LAUNCHED
+  INITIALIZED
+  TERMINATED
+  ABANDONED
+}
+
+/// One AU launch. `id` is the cmi5 `sessionid` context extension.
+model Cmi5Session {
+  id             String            @id
+  tenantId       String
+  registrationId String
+  auId           String
+  /// `Normal` | `Browse` | `Review`.
+  launchMode     String            @default("Normal")
+  status         Cmi5SessionStatus @default(LAUNCHED)
+  /// SHA-256 of the one-time secret embedded in the fetch URL.
+  fetchKeyHash   String
+  fetchedAt      DateTime?
+  expiresAt      DateTime
+  launchedAt     DateTime          @default(now())
+  initializedAt  DateTime?
+  endedAt        DateTime?
+
+  tenant       Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  registration Cmi5Registration @relation(fields: [registrationId], references: [id], onDelete: Cascade)
+  au           Cmi5Au           @relation(fields: [auId], references: [id], onDelete: Cascade)
+
+  @@index([registrationId, auId])
+  @@index([tenantId])
+}
+
+// ---------------------------------------------------------------------------
+// Webhooks
+// ---------------------------------------------------------------------------
+
+/// A tenant-registered HTTPS receiver for engine events.
+model WebhookEndpoint {
+  id          String   @id @default(cuid())
+  tenantId    String
+  url         String
+  description String?
+  /// Event types delivered to this endpoint; `*` subscribes to every event.
+  events      String[]
+  /// HMAC-SHA256 signing secret (`whsec_…`). Kept retrievable: the engine
+  /// needs the plaintext to sign each delivery.
+  secret      String
+  enabled     Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant     Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  deliveries WebhookDelivery[]
+
+  @@index([tenantId])
+}
+
+enum WebhookDeliveryStatus {
+  /// Waiting for its first attempt or a retry at `nextAttemptAt`.
+  PENDING
+  SUCCEEDED
+  /// Out of retries — the dead-letter state. Requeue with the retry endpoint.
+  FAILED
+}
+
+/// One event bound for one endpoint, with its delivery history.
+model WebhookDelivery {
+  id             String                @id @default(cuid())
+  tenantId       String
+  endpointId     String
+  /// Shared by every delivery of the same event, so receivers can dedupe.
+  eventId        String
+  eventType      String
+  /// The exact JSON body sent on every attempt.
+  payload        Json
+  status         WebhookDeliveryStatus @default(PENDING)
+  attempts       Int                   @default(0)
+  /// When the next attempt is due. Also doubles as the claim lease while an
+  /// attempt is in flight, so concurrent workers never double-send.
+  nextAttemptAt  DateTime?
+  lastAttemptAt  DateTime?
+  lastStatusCode Int?
+  lastError      String?
+  /// Start of the receiver's last response body, for the delivery log.
+  lastResponse   String?
+  deliveredAt    DateTime?
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+
+  tenant   Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  endpoint WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+
+  @@index([status, nextAttemptAt])
+  @@index([endpointId, createdAt])
 }

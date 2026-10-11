@@ -31,7 +31,7 @@ cp .env.example .env
 docker compose -f docker/docker-compose.yml up
 ```
 
-The engine is now live on `http://localhost:3000`. Health check: `GET /healthz`.
+The engine is now live on `http://localhost:3000`. Liveness: `GET /healthz`. Readiness (database + storage reachable, `503` otherwise): `GET /readyz`. Both are also served inside the API as `/api/v1/health` and `/api/v1/ready`.
 
 ### Embed in a Node app
 
@@ -54,27 +54,155 @@ await app.listen({ port: 3000 });
 Full spec: [`openapi/openapi.yaml`](openapi/openapi.yaml).
 
 ```
-POST   /api/v1/courses               Upload + register a SCORM package
-POST   /api/v1/courses/validate      Validate a package without registering
-GET    /api/v1/courses               List courses for the tenant
-GET    /api/v1/courses/:id           Course metadata + SCO tree
-DELETE /api/v1/courses/:id           Delete a course
+POST   /api/v1/courses                        Upload + register a SCORM package
+POST   /api/v1/courses/validate               Validate a package without registering
+GET    /api/v1/courses                        List courses for the tenant
+GET    /api/v1/courses/:id                    Course metadata + SCO tree
+GET    /api/v1/courses/:id/content/*          Stream an extracted package file
 
-POST   /api/v1/attempts/start        Start a learner attempt
-GET    /api/v1/attempts/:id          Attempt state
-POST   /api/v1/attempts/:id/finish   Force-terminate an attempt
+POST   /api/v1/courses/:id/attempts           Start or resume a learner attempt
+GET    /api/v1/attempts/:id                   Attempt state (objectives, interactions)
+GET    /api/v1/attempts/:id/runtime           Rehydrate CMI for a (re)launched SCO
+POST   /api/v1/attempts/:id/commit            Batched SetValue commit (+ terminate; optional idempotent `seq`)
+POST   /api/v1/attempts/:id/sync              Replay an offline commit queue (applied / duplicate / conflict)
 
-POST   /api/v1/runtime/:attemptId/initialize    SCORM Initialize
-POST   /api/v1/runtime/:attemptId/value         SetValue / GetValue
-POST   /api/v1/runtime/:attemptId/commit        Commit
-POST   /api/v1/runtime/:attemptId/terminate     Terminate
+POST   /api/v1/auth/attempt-token             Mint a short-lived, attempt-scoped JWT
+GET    /api/v1/runtime.js                     Drop-in SCORM 1.2 / 2004 browser bridge
+GET    /api/v1/play/:attemptId                Hydrated iframe player page
 
+GET    /api/v1/analytics/overview
 GET    /api/v1/analytics/courses/:id
 GET    /api/v1/analytics/learners/:id
-GET    /api/v1/analytics/overview
+
+GET    /api/v1/xapi/about                     LRS version discovery (unauthenticated)
+POST   /api/v1/xapi/statements                Store one statement or a batch
+PUT    /api/v1/xapi/statements?statementId=   Store a statement under a known id
+GET    /api/v1/xapi/statements                Query statements (filters + paging)
+GET    /api/v1/xapi/activities/state          Fetch a state doc, or list state ids
+PUT    /api/v1/xapi/activities/state          Replace a state document
+POST   /api/v1/xapi/activities/state          Merge into a state document
+DELETE /api/v1/xapi/activities/state          Delete one or all state documents
+GET    /api/v1/xapi/activities/profile        Fetch an activity profile, or list ids
+PUT    /api/v1/xapi/activities/profile        Replace an activity profile document
+POST   /api/v1/xapi/activities/profile        Merge into an activity profile document
+DELETE /api/v1/xapi/activities/profile        Delete an activity profile document
+GET    /api/v1/xapi/agents/profile            Fetch an agent profile, or list ids
+PUT    /api/v1/xapi/agents/profile            Replace an agent profile document
+POST   /api/v1/xapi/agents/profile            Merge into an agent profile document
+DELETE /api/v1/xapi/agents/profile            Delete an agent profile document
+GET    /api/v1/xapi/activities                Canonical Activity for an IRI
+GET    /api/v1/xapi/agents                    Person view of one agent
+
+POST   /api/v1/cmi5/courses                   Import a cmi5 course (ZIP or bare cmi5.xml)
+POST   /api/v1/cmi5/courses/validate          Validate a course structure without importing
+GET    /api/v1/cmi5/courses                   List cmi5 courses
+GET    /api/v1/cmi5/courses/:id               Course, AUs, and block structure
+DELETE /api/v1/cmi5/courses/:id               Delete a course and its registrations
+POST   /api/v1/cmi5/registrations             Register a learner (actor or learnerId)
+GET    /api/v1/cmi5/registrations/:id         Per-AU progress + course satisfaction
+POST   /api/v1/cmi5/registrations/:id/launch  Launch an AU → launch URL
+POST   /api/v1/cmi5/registrations/:id/waive   Waive an AU's moveOn requirement
+GET    /api/v1/cmi5/learner-preferences       Read a learner's cmi5LearnerPreferences
+PUT    /api/v1/cmi5/learner-preferences       Set language / audio preferences
+POST   /api/v1/cmi5/fetch                     One-time fetch URL → LRS auth token (AU-facing)
+GET    /api/v1/cmi5/content/:token/*          Engine-hosted AU files (AU-facing)
+
+POST   /api/v1/webhooks                       Register an endpoint (returns its secret)
+GET    /api/v1/webhooks                       List endpoints
+GET    /api/v1/webhooks/event-types           Event types you can subscribe to
+PATCH  /api/v1/webhooks/:id                   Change url / events / enabled
+DELETE /api/v1/webhooks/:id                   Delete an endpoint and its delivery log
+POST   /api/v1/webhooks/:id/rotate-secret     Replace the signing secret
+POST   /api/v1/webhooks/:id/test              Send a signed webhook.test event
+GET    /api/v1/webhooks/:id/deliveries        Delivery log (filter by status / event)
+POST   /api/v1/webhooks/deliveries/:id/retry  Re-send a delivery, incl. dead-lettered ones
 ```
 
-Auth: `Authorization: Bearer <api-key>` for tenant calls; short-lived JWT for runtime calls (issued per attempt).
+Auth: `X-API-Key: <api-key>` for tenant calls (the LRS included); a short-lived,
+attempt-scoped JWT for the browser player's runtime calls. Every LRS request
+except `/xapi/about` must also send `X-Experience-API-Version: 1.0.3`.
+
+### xAPI attachments
+
+Send statements with attachment bodies as `multipart/mixed`: the statement JSON
+first, then one part per body with `Content-Transfer-Encoding: binary` and
+`X-Experience-API-Hash: <sha2>`. The LRS checks each body against its hash and
+against the statements' `attachments` list (bodies may be omitted only for
+attachments that carry a `fileUrl`), then stores it content-addressed under
+`tenants/<id>/xapi-attachments/`. `GET /xapi/statements?attachments=true`
+returns the same `multipart/mixed` shape. Signature attachments (JWS
+RS256/384/512) must sign the statement they are attached to and are verified
+when they embed an `x5c` certificate.
+
+### Suspend and resume
+
+When SCORM content sets `cmi.exit` (`cmi.core.exit` in 1.2) to `suspend` and
+then terminates, the commit returns `suspended: true` and the attempt stays
+`IN_PROGRESS`: the session time is banked as `total_time`, and the next
+`POST /courses/:id/attempts` for that learner resumes the same attempt with
+`entry: "resume"` and its location and `suspend_data` intact. Any other exit
+finalizes the attempt, and the next start opens a new one. The `/play` page
+seeds `entry` and the learner id / name, so content can tell a resume from a
+first launch.
+
+### cmi5
+
+The engine plays the cmi5 LMS role end to end. `launch` abandons any session the
+learner left open on that AU, opens a new one, writes `LMS.LaunchData`, records
+`launched`, and returns the AU URL with `endpoint`, `fetch`, `actor`,
+`registration` and `activityId` attached. The AU redeems the fetch URL once for
+an auth token and sends it to the built-in LRS as `Authorization: Basic …`.
+
+Statements sent under that token are checked against the cmi5 statement rules
+before they are stored — `initialized` first, nothing after `terminated`, no
+LMS-only verbs, matching actor / registration / session id, the cmi5 and moveon
+categories, `completed` / `passed` once per registration, masteryScore checks,
+no moveOn verbs in Browse / Review mode — and a violation is a `403`. A token
+also only reaches its own learner and registration. When every AU in a block
+meets its moveOn criterion the engine records `satisfied` for that block, and
+when every AU in the course does, for the course.
+
+Learner preferences (`languagePreference`, `audioPreference`) are stored as the
+`cmi5LearnerPreferences` Agent Profile document, where AUs read them through the
+LRS. Set them with `PUT /cmi5/learner-preferences`, or pass
+`learnerPreferences` when creating a registration.
+
+Session tokens and hosted-content links live for `JWT_ATTEMPT_TTL_SECONDS`.
+
+### Webhooks
+
+Register an endpoint with the events it wants (or `*`):
+
+```bash
+curl -X POST $ENGINE/api/v1/webhooks -H "X-API-Key: $KEY" -H "content-type: application/json" \
+  -d '{"url":"https://example.com/hooks/scormflow","events":["course.completed","cmi5.course.satisfied"]}'
+```
+
+Events: `attempt.started`, `attempt.suspended`, `attempt.terminated`, `course.completed`,
+`course.passed`, `course.failed`, `score.updated` (SCORM attempts — each fires on
+the transition, not on every commit); `objective.mastered` (a SCORM objective's
+success status first becomes `passed`, matched by objective id);
+`cmi5.session.terminated`, `cmi5.session.abandoned`, `cmi5.au.waived`,
+`cmi5.block.satisfied`, `cmi5.course.satisfied`; `xapi.statement.stored` (once
+per newly stored LRS statement — including cmi5 and LMS-issued ones, never for a
+duplicate resend; `data.statement` is the stored statement); and `webhook.test`.
+
+Each delivery is a JSON `POST` of `{ id, type, createdAt, data }` with
+`ScormFlow-Signature: t=<unix>,v1=<hex>` — HMAC-SHA256 over `"<t>.<raw body>"`
+with the endpoint secret. Verify it against the raw body before trusting the
+event (`verifySignature` here, or `verifyWebhookSignature` in `@scormflow/sdk`).
+A 2xx acknowledges it. Anything else — including redirects and timeouts — is
+retried with exponential backoff (`WEBHOOK_RETRY_BASE_SECONDS` × 2ⁿ, capped at 6 h)
+until `WEBHOOK_MAX_ATTEMPTS`, then the delivery is parked as `FAILED` (the
+dead-letter state) and can be re-sent from the delivery log. Delivery is
+at-least-once: dedupe on the event `id`.
+
+Retries are picked up by an in-process poller (`WEBHOOK_WORKER_INTERVAL_MS`) that
+the server entrypoint starts; when embedding, pass `startWebhookWorker: true` to
+`buildApp`. Deliveries are claimed with a lease, so several engine instances can
+share one database. Endpoint URLs on localhost / private / link-local addresses
+are refused unless `WEBHOOK_ALLOW_PRIVATE_URLS=true`; this check does not resolve
+DNS, so pair it with egress filtering if tenants are untrusted.
 
 ---
 
@@ -82,16 +210,18 @@ Auth: `Authorization: Bearer <api-key>` for tenant calls; short-lived JWT for ru
 
 ```
 src/
-├── core/         Runtime engine (CMI model, validators)        [planned]
 ├── parser/       imsmanifest.xml + ZIP extraction              [done]
-├── runtime/      SCORM 1.2 + 2004 API handlers                 [planned]
-├── tracking/     Attempt + progress persistence                [planned]
-├── storage/      Pluggable storage adapters                    [local done, S3 planned]
-├── analytics/    Analytics + reporting                         [planned]
-├── http/         Fastify routes + middleware                   [partial]
-├── auth/         API keys + JWT                                [api-key done, jwt planned]
-├── services/     Course / attempt / runtime services           [course done]
-├── db/           Prisma schema + migrations                    [done]
+├── runtime/      SCORM 1.2 + 2004 CMI model + session          [done]
+├── tracking/     Attempt + progress persistence                [done]
+├── xapi/         Built-in LRS (statements, documents, lookups) [done]
+├── cmi5/         cmi5 course structure, launch, statement rules [done]
+├── webhooks/     Endpoints, signing, delivery + retry worker   [done]
+├── storage/      Storage adapters: local disk, S3 / R2 / MinIO [done]
+├── analytics/    Analytics + reporting                         [done]
+├── http/         Fastify routes + runtime bridge               [done]
+├── auth/         API keys + attempt JWTs                       [done]
+├── services/     Course / attempt / runtime services           [done]
+├── db/           Prisma client                                 [done]
 └── server.ts     Entrypoint
 ```
 
@@ -108,8 +238,22 @@ Database: PostgreSQL (production) or SQLite (dev). ORM: Prisma. Schema in [`pris
 | `DATABASE_URL` | Postgres / SQLite connection string |
 | `STORAGE_DRIVER` | `local`, `s3` |
 | `STORAGE_LOCAL_DIR` | Disk path for local driver |
+| `S3_BUCKET`, `S3_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | Required for the `s3` driver (`S3_REGION=auto` for R2) |
+| `S3_ENDPOINT`, `S3_FORCE_PATH_STYLE` | Point the `s3` driver at R2 / MinIO / another S3-compatible store; MinIO needs path style |
+| `S3_SESSION_TOKEN` | Only for temporary (STS) credentials |
+| `STORAGE_PREFIX` | Optional namespace for every stored key (tenant files sit under `tenants/<id>/` beneath it) |
+| `RATE_LIMIT_MAX` | Authenticated requests each tenant may make per window; `0` disables (default 0) |
+| `RATE_LIMIT_WINDOW_SECONDS` | Rate-limit window length (default 60) |
 | `JWT_SECRET` | Signing secret for runtime tokens |
-| `API_BASE_URL` | Public base URL (used in `/play/:attemptId` links) |
+| `JWT_ATTEMPT_TTL_SECONDS` | Lifetime of an attempt-scoped player token |
+| `SCORM_VALIDATION_MODE` | `lenient` (default) or `strict` CMI write validation |
+| `XAPI_AUTHORITY_HOMEPAGE` | Home page of the `authority` the LRS stamps on statements |
+| `XAPI_REQUIRE_PRECONDITIONS` | Require `If-Match` / `If-None-Match` on State API writes |
+| `WEBHOOK_MAX_ATTEMPTS` | Attempts before a delivery is dead-lettered (default 8) |
+| `WEBHOOK_RETRY_BASE_SECONDS` | First retry delay; doubles each attempt, capped at 6 h (default 30) |
+| `WEBHOOK_TIMEOUT_MS` | Per-attempt request timeout (default 10000) |
+| `WEBHOOK_WORKER_INTERVAL_MS` | Retry poll interval; `0` disables the poller (default 5000) |
+| `WEBHOOK_ALLOW_PRIVATE_URLS` | Allow endpoints on localhost / private networks (default false) |
 
 ---
 
@@ -119,7 +263,7 @@ Checkboxes reflect the actual state of `main`.
 
 ### Phase 1 — MVP (foundation)
 - [x] Repo init, TypeScript strict mode, Fastify app skeleton
-- [x] Prisma schema (Tenant, ApiKey, Course, Sco, Learner, Attempt, Interaction, Objective, CommitLog)
+- [x] Prisma schema (Tenant, ApiKey, Course, Sco, Learner, Attempt, Interaction, Objective, CommitLog; xAPI, cmi5 + webhook tables)
 - [x] Pluggable `StorageAdapter` interface + local disk driver
 - [x] SCORM ZIP extraction (yauzl)
 - [x] `imsmanifest.xml` parser (fast-xml-parser)
@@ -130,26 +274,35 @@ Checkboxes reflect the actual state of `main`.
 - [x] API key auth + tenant scoping (`requireApiKey` preHandler)
 - [x] OpenAPI 3.1 spec as source of truth
 - [x] Dockerfile + docker-compose (engine + Postgres)
-- [ ] S3 / R2 / MinIO storage driver
-- [ ] JWT issuance for runtime / player tokens
-- [ ] Attempt lifecycle routes (`/attempts/start`, `/:id`, `/:id/finish`)
+- [x] S3 / R2 / MinIO storage driver (dependency-free SigV4, multipart uploads)
+- [x] Readiness probe that checks the database and storage
+- [x] JWT issuance for runtime / player tokens (`POST /auth/attempt-token`)
+- [x] Attempt lifecycle routes (start/resume, read-back, terminate-on-commit)
 - [x] CMI data model + value validation (SCORM 1.2)
 - [x] CMI data model + value validation (SCORM 2004)
-- [ ] Runtime API routes (`initialize` / `value` / `commit` / `terminate`)
-- [ ] Resume support (suspend_data, lesson_location persistence)
-- [ ] Basic analytics endpoints (course / learner / overview)
-- [ ] Standalone iframe player route (`GET /play/:attemptId`)
-- [ ] Drop-in runtime bridge (`GET /runtime.js`)
-- [ ] Multi-tenant rate limiting + isolated storage prefixes
-- [ ] End-to-end test: upload → launch → track → resume → complete
+- [x] Runtime API routes (batched commit + runtime rehydration)
+- [x] Resume support (suspend_data, lesson_location persistence; exit=suspend keeps the attempt open across sessions)
+- [x] Basic analytics endpoints (course / learner / overview)
+- [x] Standalone iframe player route (`GET /play/:attemptId`)
+- [x] Drop-in runtime bridge (`GET /runtime.js`)
+- [x] Multi-tenant rate limiting + isolated storage prefixes
+- [x] End-to-end test: upload → launch → track → resume → complete
 
 ### Phase 2 — Strong differentiators
-- [ ] xAPI 1.0.3 statement endpoint + state / activity / agent profile APIs
-- [ ] Built-in LRS (xAPI store, queryable, pluggable backend)
-- [ ] cmi5 launch + registration management
-- [ ] cmi5 session lifecycle (initialized → completed / passed / failed / terminated / abandoned)
-- [ ] Webhook system (signed payloads, retries, delivery log)
-- [ ] Offline sync queue + reconciliation
+- [x] xAPI 1.0.3 Statement API (store, query, void, paging)
+- [x] xAPI 1.0.3 State API (documents, merge, ETag preconditions)
+- [x] xAPI 1.0.3 Activity Profile + Agent Profile APIs
+- [x] xAPI 1.0.3 Activity + Agent (Person) lookups
+- [x] xAPI attachments (multipart statement upload, `attachments=true` retrieval, JWS signature checks)
+- [x] Built-in LRS, tenant-scoped and queryable
+- [x] cmi5 course structure import (`cmi5.xml`, ZIP or structure-only)
+- [x] cmi5 launch + registration management (LaunchData, one-time fetch URL, session tokens)
+- [x] cmi5 session lifecycle (initialized → completed / passed / failed / terminated / abandoned)
+- [x] cmi5 statement rules enforced by the LRS; moveOn evaluation, waive, course `satisfied`
+- [x] cmi5 block-level `satisfied` statements and `cmi5LearnerPreferences` agent profile
+- [x] Webhook system (signed payloads, retries, dead-letter, delivery log)
+- [x] Webhook events for xAPI statements and SCORM objectives (`objective.mastered`)
+- [x] Offline sync queue + reconciliation (`POST /attempts/:id/sync`, idempotent `seq` replay, conflict reporting)
 - [ ] Certificate engine (PDF generation on completion)
 - [ ] Event bus (BullMQ / Redis streams)
 - [ ] Plugin system (`plugins: [analyticsPlugin(), certificatePlugin()]`)

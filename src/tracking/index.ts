@@ -13,10 +13,16 @@ export {
   getRuntimeState,
   recordCommit,
   startOrResumeAttempt,
+  syncCommits,
 } from './attempts.js';
 export type {
   ApplyCommitInput,
   ApplyCommitResult,
+  QueuedCommit,
+  SyncCommitOutcome,
+  SyncCommitsInput,
+  SyncCommitsResult,
+  SyncCommitStatus,
   RecordCommitInput,
   RuntimeState,
   SetValueIssue,

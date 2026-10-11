@@ -27,7 +27,19 @@ info:
 
     ## Tenancy
     Every resource is scoped to a tenant resolved from the API key. Attempt JWTs
-    inherit the tenant of the API key that issued them.
+    inherit the tenant of the API key that issued them. Uploaded content is stored
+    under a per-tenant prefix (`tenants/<tenantId>/`), optionally beneath a
+    deployment-wide `STORAGE_PREFIX`.
+
+    ## Rate limiting
+    When the operator sets `RATE_LIMIT_MAX`, each tenant may make that many
+    authenticated requests per `RATE_LIMIT_WINDOW_SECONDS` window — one budget
+    shared by all of its API keys, attempt tokens and cmi5 sessions. Counted
+    responses carry `X-RateLimit-Limit`, `X-RateLimit-Remaining` and
+    `X-RateLimit-Reset` (seconds until the window refills). A request over budget
+    gets `429` with code `rate_limited` and a `Retry-After` header, and was not
+    processed, so it is safe to retry after that delay. Limits are enforced per
+    engine instance.
   contact:
     name: SCORM Engine
     url: https://github.com/scorm-engine
@@ -50,6 +62,48 @@ tags:
     description: SCORM runtime API — called by the in-browser player bridge.
   - name: Analytics
     description: Aggregated progress and performance data.
+  - name: LRS
+    description: |
+      Built-in Learning Record Store implementing the xAPI 1.0.3 Statement,
+      State, Activity Profile, Agent Profile, Activity, Agent and About
+      resources under `/xapi`.
+
+      Three deliberate departures from a stock LRS:
+      - **Auth** is this engine's `X-API-Key` header instead of xAPI's Basic/OAuth,
+        so the LRS shares one tenancy model with courses and attempts.
+      - **Paging** uses an opaque `cursor` query parameter; follow the `more`
+        link verbatim rather than constructing it.
+      - **Activity and Agent lookups** are derived from stored statements rather
+        than from a separate registry, since this LRS keeps no such registry.
+
+      **Attachments** travel as `multipart/mixed`: the statement JSON first,
+      then one part per attachment body with `Content-Transfer-Encoding: binary`
+      and `X-Experience-API-Hash` set to its SHA-2 digest. Bodies are stored
+      content-addressed per tenant and returned by `GET /xapi/statements` with
+      `attachments=true`. Signature attachments (JWS, RS256/384/512) are checked
+      against the statement they sign, and verified cryptographically when they
+      embed an `x5c` certificate.
+
+      A cmi5 AU authenticates with the session token its fetch URL issued
+      (`Authorization: Basic …`). Such a token only reaches its own learner and
+      registration, and statements sent with it must obey the cmi5 statement
+      rules — violations are a `403`.
+  - name: cmi5
+    description: |
+      cmi5 course hosting: import a course structure, register learners, launch
+      AUs, and track moveOn satisfaction. The engine plays the LMS role; AUs talk
+      to the built-in LRS directly.
+  - name: Webhooks
+    description: |
+      Register HTTPS endpoints for engine events (course completions, score
+      changes, cmi5 satisfaction, …). Every delivery is a `POST` of a
+      `WebhookPayload` signed with the endpoint secret:
+      `ScormFlow-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<raw body>">`.
+      `ScormFlow-Event` names the event and `ScormFlow-Delivery` the delivery.
+      Any 2xx acknowledges it; anything else (including redirects and timeouts)
+      is retried with exponential backoff until `WEBHOOK_MAX_ATTEMPTS`, after
+      which the delivery is `FAILED` and can be retried by hand. Deliveries are
+      at-least-once — dedupe on the payload `id`.
   - name: Auth
     description: Token issuance for player sessions.
   - name: System
@@ -71,7 +125,11 @@ paths:
   /health:
     get:
       tags: [System]
+      operationId: getHealth
       summary: Liveness probe
+      description: |
+        Also served at the server root as `GET /healthz` for load balancers and
+        container health checks.
       security: []
       responses:
         '200':
@@ -80,6 +138,7 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [status, version]
                 properties:
                   status: { type: string, enum: [ok] }
                   version: { type: string }
@@ -87,11 +146,25 @@ paths:
   /ready:
     get:
       tags: [System]
+      operationId: getReadiness
       summary: Readiness probe (DB + storage reachable)
+      description: |
+        Runs a trivial database query and the storage driver's own probe (a
+        writable directory for `local`, `HeadBucket` for `s3`). Each check has a
+        3 s budget. Failure details are logged, not returned. Also served at the
+        server root as `GET /readyz`.
       security: []
       responses:
-        '200': { description: Ready }
-        '503': { description: Not ready }
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReadinessReport' }
+        '503':
+          description: Not ready — at least one dependency check failed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReadinessReport' }
 
   # ─────────────────────────────────────────────────────────────────────────
   # Embed (SDK-less integration)
@@ -144,12 +217,12 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '403':
           description: Token is not valid for this attempt.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
 
   /runtime.js:
     get:
@@ -400,6 +473,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '404': { $ref: '#/components/responses/NotFound' }
 
   /courses/validate:
@@ -599,6 +673,51 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /attempts/{attemptId}/sync:
+    parameters:
+      - $ref: '#/components/parameters/AttemptId'
+    post:
+      tags: [Runtime]
+      summary: Reconcile an offline commit queue
+      operationId: syncAttemptCommits
+      description: |
+        Replays commits a player recorded while offline, in `seq` order, through
+        the same validation and persistence as `POST /attempts/{id}/commit`.
+
+        Reconciliation is idempotent: commits at or below the attempt's
+        `lastCommitSeq` (or repeated within the batch) are reported as
+        `duplicate` and skipped, so a client can resend its whole queue after a
+        dropped response. Once the attempt is finished — by a terminate in this
+        batch or earlier — every later commit is reported as `conflict`; server
+        state wins. Per-commit outcomes are returned rather than failing the batch.
+
+        Auth matches the commit endpoint (API key or attempt token).
+      security:
+        - ApiKeyAuth: []
+        - AttemptJWT: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SyncRequest' }
+      responses:
+        '200':
+          description: Per-commit reconciliation outcomes.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SyncResponse' }
+        '400':
+          description: Malformed queue (missing/negative `seq`, bad `recordedAt`, empty or oversized batch).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: Token is not valid for this attempt.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   # ─────────────────────────────────────────────────────────────────────────
   # Analytics
   # ─────────────────────────────────────────────────────────────────────────
@@ -642,6 +761,919 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/LearnerAnalytics' }
 
+  # ─────────────────────────────────────────────────────────────────────────
+  # LRS — xAPI 1.0.3
+  # ─────────────────────────────────────────────────────────────────────────
+  /xapi/about:
+    get:
+      tags: [LRS]
+      summary: xAPI versions this LRS implements
+      description: Unauthenticated, and exempt from the version header — this is how a client discovers what we speak.
+      security: []
+      responses:
+        '200':
+          description: About document
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/XapiAbout' }
+
+  /xapi/statements:
+    parameters:
+      - $ref: '#/components/parameters/XapiVersion'
+    post:
+      tags: [LRS]
+      summary: Store one statement or a batch
+      description: |
+        Statements are immutable. Re-sending a byte-identical statement under an
+        id already stored is a no-op (safe retry); sending a *different* statement
+        under that id is a `409`.
+
+        To include attachment bodies, send `multipart/mixed` with the statement
+        JSON as the first part. Every declared attachment without a `fileUrl`
+        must have its body in the request, and every body must be declared;
+        otherwise the request is a `400` (`missing_attachment`,
+        `unexpected_attachment`, `attachment_hash_mismatch`, `invalid_signature`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/XapiStatement'
+                - type: array
+                  items: { $ref: '#/components/schemas/XapiStatement' }
+          multipart/mixed:
+            schema:
+              type: string
+              format: binary
+              description: Statement JSON part followed by attachment parts.
+      responses:
+        '200':
+          description: Ids of the stored statements, in request order.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { type: string, format: uuid }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403':
+          description: Sent with a cmi5 session token, and a statement breaks a cmi5 statement rule (`cmi5_rule_violation`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: A different statement is already stored under one of these ids.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    put:
+      tags: [LRS]
+      summary: Store a single statement under a known id
+      parameters:
+        - name: statementId
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/XapiStatement' }
+          multipart/mixed:
+            schema:
+              type: string
+              format: binary
+              description: Statement JSON part followed by attachment parts.
+      responses:
+        '204': { description: Stored. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409':
+          description: A different statement is already stored under this id.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    get:
+      tags: [LRS]
+      summary: Query statements
+      description: |
+        With `statementId` or `voidedStatementId` the response is a single
+        statement; otherwise it is a StatementResult envelope. The two id
+        parameters cannot be combined with any filter.
+
+        Voided statements are excluded from filtered results and are reachable
+        only through `voidedStatementId`.
+      parameters:
+        - name: statementId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: voidedStatementId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: agent
+          in: query
+          description: JSON-encoded Agent or Group.
+          schema: { type: string }
+        - name: verb
+          in: query
+          schema: { type: string, format: iri }
+        - name: activity
+          in: query
+          schema: { type: string, format: iri }
+        - name: registration
+          in: query
+          schema: { type: string, format: uuid }
+        - name: related_activities
+          in: query
+          description: Also match the activity in context activities, not just as the object.
+          schema: { type: boolean, default: false }
+        - name: related_agents
+          in: query
+          description: Also match the agent as instructor, team, object or authority.
+          schema: { type: boolean, default: false }
+        - name: since
+          in: query
+          schema: { type: string, format: date-time }
+        - name: until
+          in: query
+          schema: { type: string, format: date-time }
+        - name: limit
+          in: query
+          description: 0 means "as many as the LRS allows" (100).
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: ascending
+          in: query
+          schema: { type: boolean, default: false }
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [ids, exact, canonical]
+            default: exact
+        - name: cursor
+          in: query
+          description: Opaque paging token; supplied by the `more` link, never constructed by hand.
+          schema: { type: string }
+        - name: attachments
+          in: query
+          description: |
+            Respond with `multipart/mixed`: the usual JSON first, then the stored
+            body of every attachment the returned statements reference.
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: A StatementResult, or a single statement when queried by id.
+          headers:
+            X-Experience-API-Consistent-Through:
+              schema: { type: string, format: date-time }
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/XapiStatementResult'
+                  - $ref: '#/components/schemas/XapiStatement'
+            multipart/mixed:
+              schema:
+                type: string
+                format: binary
+                description: Sent when `attachments=true`.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /xapi/activities/state:
+    parameters:
+      - $ref: '#/components/parameters/XapiVersion'
+      - name: activityId
+        in: query
+        required: true
+        schema: { type: string, format: iri }
+      - name: agent
+        in: query
+        required: true
+        description: JSON-encoded Agent or Group.
+        schema: { type: string }
+      - name: registration
+        in: query
+        schema: { type: string, format: uuid }
+      - name: stateId
+        in: query
+        description: Omit on GET to list ids, or on DELETE to clear every document.
+        schema: { type: string }
+    get:
+      tags: [LRS]
+      summary: Fetch a state document, or list the ids of all of them
+      parameters:
+        - name: since
+          in: query
+          description: When listing, only ids updated after this instant.
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: The document (its own content type), or a JSON array of state ids.
+          headers:
+            ETag: { schema: { type: string } }
+            Last-Modified: { schema: { type: string } }
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: array
+                    items: { type: string }
+                  - type: object
+                    additionalProperties: true
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [LRS]
+      summary: Replace a state document
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        '204':
+          description: Stored.
+          headers:
+            ETag: { schema: { type: string } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409':
+          description: Document exists and `XAPI_REQUIRE_PRECONDITIONS` is on, but no If-Match/If-None-Match was sent.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '412':
+          description: If-Match or If-None-Match precondition failed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    post:
+      tags: [LRS]
+      summary: Merge into a state document
+      description: Both the stored and the posted document must be JSON objects; anything else is a 400 rather than a silent overwrite.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '204':
+          description: Merged.
+          headers:
+            ETag: { schema: { type: string } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '412':
+          description: Precondition failed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    delete:
+      tags: [LRS]
+      summary: Delete one state document, or every document for an activity + agent
+      responses:
+        '204': { description: Deleted. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '412':
+          description: Precondition failed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /xapi/activities/profile:
+    parameters:
+      - $ref: '#/components/parameters/XapiVersion'
+      - name: activityId
+        in: query
+        required: true
+        schema: { type: string, format: iri }
+      - name: profileId
+        in: query
+        description: Omit on GET to list the ids of every profile for this activity.
+        schema: { type: string }
+    get:
+      tags: [LRS]
+      summary: Fetch an activity profile document, or list the ids of all of them
+      parameters:
+        - $ref: '#/components/parameters/XapiDocumentSince'
+      responses:
+        '200': { $ref: '#/components/responses/XapiDocument' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [LRS]
+      summary: Replace an activity profile document
+      requestBody: { $ref: '#/components/requestBodies/XapiDocument' }
+      responses:
+        '204': { $ref: '#/components/responses/XapiDocumentStored' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/XapiPreconditionRequired' }
+        '412': { $ref: '#/components/responses/XapiPreconditionFailed' }
+    post:
+      tags: [LRS]
+      summary: Merge into an activity profile document
+      description: Both the stored and the posted document must be JSON objects; anything else is a 400 rather than a silent overwrite.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '204': { $ref: '#/components/responses/XapiDocumentStored' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/XapiPreconditionRequired' }
+        '412': { $ref: '#/components/responses/XapiPreconditionFailed' }
+    delete:
+      tags: [LRS]
+      summary: Delete an activity profile document
+      responses:
+        '204': { description: Deleted. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '412': { $ref: '#/components/responses/XapiPreconditionFailed' }
+
+  /xapi/agents/profile:
+    parameters:
+      - $ref: '#/components/parameters/XapiVersion'
+      - name: agent
+        in: query
+        required: true
+        description: JSON-encoded Agent or Group.
+        schema: { type: string }
+      - name: profileId
+        in: query
+        description: Omit on GET to list the ids of every profile for this agent.
+        schema: { type: string }
+    get:
+      tags: [LRS]
+      summary: Fetch an agent profile document, or list the ids of all of them
+      parameters:
+        - $ref: '#/components/parameters/XapiDocumentSince'
+      responses:
+        '200': { $ref: '#/components/responses/XapiDocument' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [LRS]
+      summary: Replace an agent profile document
+      requestBody: { $ref: '#/components/requestBodies/XapiDocument' }
+      responses:
+        '204': { $ref: '#/components/responses/XapiDocumentStored' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/XapiPreconditionRequired' }
+        '412': { $ref: '#/components/responses/XapiPreconditionFailed' }
+    post:
+      tags: [LRS]
+      summary: Merge into an agent profile document
+      description: Both the stored and the posted document must be JSON objects; anything else is a 400 rather than a silent overwrite.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '204': { $ref: '#/components/responses/XapiDocumentStored' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/XapiPreconditionRequired' }
+        '412': { $ref: '#/components/responses/XapiPreconditionFailed' }
+    delete:
+      tags: [LRS]
+      summary: Delete an agent profile document
+      responses:
+        '204': { description: Deleted. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '412': { $ref: '#/components/responses/XapiPreconditionFailed' }
+
+  /xapi/activities:
+    parameters:
+      - $ref: '#/components/parameters/XapiVersion'
+      - name: activityId
+        in: query
+        required: true
+        schema: { type: string, format: iri }
+    get:
+      tags: [LRS]
+      summary: The canonical Activity for an IRI
+      description: |
+        Derived from the statements this LRS has accepted — we keep no separate
+        activity registry. The returned definition is the merge of every
+        definition clients have sent for that IRI, newest winning.
+      responses:
+        '200':
+          description: The activity.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/XapiActivity' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404':
+          description: No stored statement references this activity.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /xapi/agents:
+    parameters:
+      - $ref: '#/components/parameters/XapiVersion'
+      - name: agent
+        in: query
+        required: true
+        description: JSON-encoded Agent or Group.
+        schema: { type: string }
+    get:
+      tags: [LRS]
+      summary: The Person this LRS knows for an agent
+      description: |
+        A Person is an Agent whose identifying properties are arrays — everything
+        the LRS has seen for one inverse-functional identifier. An agent with no
+        statements on file still returns a Person carrying the IFI you asked for.
+      responses:
+        '200':
+          description: The person.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/XapiPerson' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # cmi5
+  # ─────────────────────────────────────────────────────────────────────────
+  /cmi5/courses:
+    get:
+      tags: [cmi5]
+      summary: List cmi5 courses
+      responses:
+        '200':
+          description: Course list
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Cmi5CourseListResponse' }
+    post:
+      tags: [cmi5]
+      summary: Import a cmi5 course
+      description: |
+        Accepts a ZIP with `cmi5.xml` at its root (the engine hosts the files), or
+        a bare `cmi5.xml` whose AU urls are all absolute (content hosted elsewhere).
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+                title: { type: string, description: Override the course title. }
+      responses:
+        '201':
+          description: Course imported
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Cmi5Course' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '422':
+          description: Invalid package or course structure
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /cmi5/courses/validate:
+    post:
+      tags: [cmi5]
+      summary: Validate a cmi5 package without importing it
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '200':
+          description: Validation report
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Cmi5ValidationReport' }
+
+  /cmi5/courses/{cmi5CourseId}:
+    parameters:
+      - name: cmi5CourseId
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [cmi5]
+      summary: Get a cmi5 course
+      responses:
+        '200':
+          description: Course
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Cmi5Course' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [cmi5]
+      summary: Delete a cmi5 course, its registrations and hosted files
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /cmi5/registrations:
+    post:
+      tags: [cmi5]
+      summary: Register a learner for a cmi5 course
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Cmi5RegistrationRequest' }
+      responses:
+        '201':
+          description: Registration created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Cmi5Registration' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /cmi5/learner-preferences:
+    get:
+      tags: [cmi5]
+      summary: Read a learner's cmi5LearnerPreferences
+      parameters:
+        - name: agent
+          in: query
+          description: JSON-encoded xAPI Agent. Either this or `learnerId`.
+          schema: { type: string }
+        - name: learnerId
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Stored preferences
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Cmi5LearnerPreferences' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [cmi5]
+      summary: Set a learner's cmi5LearnerPreferences
+      description: |
+        Replaces the learner's `cmi5LearnerPreferences` Agent Profile document.
+        It belongs to the learner, not a registration, so it applies to every
+        course they launch.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Cmi5LearnerPreferencesRequest' }
+      responses:
+        '200':
+          description: Stored preferences
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Cmi5LearnerPreferences' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /cmi5/registrations/{registrationId}:
+    parameters:
+      - name: registrationId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [cmi5]
+      summary: Registration progress, per AU
+      responses:
+        '200':
+          description: Registration
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Cmi5Registration' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /cmi5/registrations/{registrationId}/launch:
+    parameters:
+      - name: registrationId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [cmi5]
+      summary: Launch an AU
+      description: |
+        Abandons any session the learner left open on this AU, opens a new
+        session, writes the `LMS.LaunchData` state document, records `launched`,
+        and returns the launch URL.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Cmi5LaunchRequest' }
+      responses:
+        '200':
+          description: Launch URL
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Cmi5LaunchResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /cmi5/registrations/{registrationId}/waive:
+    parameters:
+      - name: registrationId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [cmi5]
+      summary: Waive an AU's moveOn requirement
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Cmi5WaiveRequest' }
+      responses:
+        '200':
+          description: Updated registration
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Cmi5Registration' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: The AU is already satisfied.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /cmi5/fetch:
+    post:
+      tags: [cmi5]
+      summary: Redeem a fetch URL for an LRS auth token (AU-facing)
+      description: |
+        The `fetch` launch parameter points here. Each fetch URL works exactly
+        once; it carries its own one-time key, so no other credentials are needed.
+      security: []
+      parameters:
+        - { name: session, in: query, required: true, schema: { type: string } }
+        - { name: key, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Auth token
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Cmi5FetchResponse' }
+        '401':
+          description: Fetch URL already redeemed, invalid, or expired
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Cmi5FetchError' }
+
+  /cmi5/content/{token}/{path}:
+    parameters:
+      - name: token
+        in: path
+        required: true
+        description: Content token minted into the launch URL.
+        schema: { type: string }
+      - name: path
+        in: path
+        required: true
+        description: File path inside the package.
+        schema: { type: string }
+    get:
+      tags: [cmi5]
+      summary: Stream a file from an engine-hosted cmi5 package (AU-facing)
+      security: []
+      responses:
+        '200':
+          description: File contents
+          content:
+            '*/*':
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Webhooks
+  # ───────────────────────────────────────────────────────────────────────
+  /webhooks:
+    get:
+      tags: [Webhooks]
+      summary: List webhook endpoints
+      responses:
+        '200':
+          description: Endpoints, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/WebhookEndpoint' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [Webhooks]
+      summary: Register a webhook endpoint
+      description: The response is the only time the signing `secret` is shown, apart from rotation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WebhookEndpointCreate' }
+      responses:
+        '201':
+          description: Endpoint created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookEndpointWithSecret' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /webhooks/event-types:
+    get:
+      tags: [Webhooks]
+      summary: List the event types an endpoint can subscribe to
+      responses:
+        '200':
+          description: Event types
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, wildcard]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/WebhookEventType' }
+                  wildcard:
+                    type: string
+                    description: Subscribes to every event, including ones added later.
+                    example: '*'
+
+  /webhooks/{webhookId}:
+    parameters:
+      - name: webhookId
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Webhooks]
+      summary: Get a webhook endpoint
+      responses:
+        '200':
+          description: Endpoint
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookEndpoint' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Webhooks]
+      summary: Update a webhook endpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WebhookEndpointUpdate' }
+      responses:
+        '200':
+          description: Updated endpoint
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookEndpoint' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Webhooks]
+      summary: Delete a webhook endpoint and its delivery log
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /webhooks/{webhookId}/rotate-secret:
+    parameters:
+      - name: webhookId
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [Webhooks]
+      summary: Replace the signing secret
+      description: The old secret stops working immediately.
+      responses:
+        '200':
+          description: Endpoint with its new secret
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookEndpointWithSecret' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /webhooks/{webhookId}/test:
+    parameters:
+      - name: webhookId
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [Webhooks]
+      summary: Send a test event
+      description: |
+        Sends a `webhook.test` event to this endpoint only — even when it is
+        disabled or not subscribed — and answers once the first attempt is done.
+      responses:
+        '200':
+          description: The delivery, after its first attempt
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookDelivery' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /webhooks/{webhookId}/deliveries:
+    parameters:
+      - name: webhookId
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Webhooks]
+      summary: The endpoint's delivery log, newest first
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/WebhookDeliveryStatus' }
+        - name: eventType
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+        - name: before
+          in: query
+          description: The previous page's `nextCursor`.
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Deliveries
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/WebhookDelivery' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /webhooks/deliveries/{deliveryId}:
+    parameters:
+      - name: deliveryId
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Webhooks]
+      summary: Get one delivery
+      responses:
+        '200':
+          description: Delivery
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookDelivery' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /webhooks/deliveries/{deliveryId}/retry:
+    parameters:
+      - name: deliveryId
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [Webhooks]
+      summary: Re-send a delivery now
+      description: |
+        Works in any state, including `FAILED` (the dead-letter state) and
+        `SUCCEEDED`. A manual retry gets one attempt; if it fails the delivery
+        goes back to `FAILED`.
+      responses:
+        '200':
+          description: The delivery, after the attempt
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookDelivery' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
 components:
   # ───────────────────────────────────────────────────────────────────────
   # Security
@@ -659,6 +1691,12 @@ components:
       description: |
         Short-lived JWT scoped to a single attempt. Issued via /auth/attempt-token.
         Used by the in-browser player.
+    Cmi5Session:
+      type: http
+      scheme: basic
+      description: |
+        cmi5 session token from `POST /cmi5/fetch`, sent verbatim as
+        `Authorization: Basic <auth-token>`. Accepted by the LRS resources.
 
   # ───────────────────────────────────────────────────────────────────────
   # Reusable parameters
@@ -683,11 +1721,58 @@ components:
       in: query
       schema: { type: string }
       description: Opaque pagination cursor returned by the previous page.
+    XapiVersion:
+      name: X-Experience-API-Version
+      in: header
+      required: true
+      description: Must be `1.0` or `1.0.x`. Required on every LRS resource except About.
+      schema: { type: string, default: '1.0.3' }
+    XapiDocumentSince:
+      name: since
+      in: query
+      description: When listing document ids, only those updated after this instant.
+      schema: { type: string, format: date-time }
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Reusable request bodies
+  # ───────────────────────────────────────────────────────────────────────
+  requestBodies:
+    XapiDocument:
+      required: true
+      description: An opaque document body — JSON, text or binary.
+      content:
+        application/json:
+          schema: { type: object, additionalProperties: true }
+        application/octet-stream:
+          schema: { type: string, format: binary }
 
   # ───────────────────────────────────────────────────────────────────────
   # Reusable responses
   # ───────────────────────────────────────────────────────────────────────
+  headers:
+    RateLimitLimit:
+      description: Requests the tenant may make per window. Present only when rate limiting is on.
+      schema: { type: integer }
+    RateLimitRemaining:
+      description: Requests left in the current window.
+      schema: { type: integer }
+    RateLimitReset:
+      description: Seconds until the current window ends and the budget refills.
+      schema: { type: integer }
+
   responses:
+    TooManyRequests:
+      description: The tenant has exhausted its request budget for the current window; the request was not processed.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying.
+          schema: { type: integer }
+        X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+        X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+        X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
     BadRequest:
       description: Request was malformed.
       content:
@@ -700,6 +1785,35 @@ components:
           schema: { $ref: '#/components/schemas/Error' }
     Unauthorized:
       description: Missing or invalid credentials.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    XapiDocument:
+      description: The document (in its own content type), or a JSON array of document ids.
+      headers:
+        ETag: { schema: { type: string } }
+        Last-Modified: { schema: { type: string } }
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - type: array
+                items: { type: string }
+              - type: object
+                additionalProperties: true
+        application/octet-stream:
+          schema: { type: string, format: binary }
+    XapiDocumentStored:
+      description: Stored.
+      headers:
+        ETag: { schema: { type: string } }
+    XapiPreconditionRequired:
+      description: Document exists and `XAPI_REQUIRE_PRECONDITIONS` is on, but no If-Match/If-None-Match was sent.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    XapiPreconditionFailed:
+      description: If-Match or If-None-Match precondition failed.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -721,6 +1835,18 @@ components:
           type: object
           additionalProperties: true
         requestId: { type: string }
+
+    ReadinessReport:
+      type: object
+      required: [status, checks]
+      properties:
+        status: { type: string, enum: [ready, not_ready] }
+        checks:
+          type: object
+          required: [database, storage]
+          properties:
+            database: { type: string, enum: [ok, error] }
+            storage: { type: string, enum: [ok, error] }
 
     Pagination:
       type: object
@@ -906,6 +2032,12 @@ components:
           properties:
             id: { type: string }
             name: { type: string, nullable: true }
+        lastCommitSeq:
+          type: integer
+          nullable: true
+          description: |
+            Highest client commit `seq` applied so far (null if no commit carried
+            one). Offline clients drop queued commits at or below it.
 
     StartAttemptResponse:
       type: object
@@ -968,11 +2100,26 @@ components:
           default: false
           description: |
             When true, Terminate the session (final commit) and finalize the
-            attempt instead of leaving it open for further commits.
+            attempt instead of leaving it open for further commits. If the
+            content set `cmi.exit` (`cmi.core.exit` in 1.2) to `suspend`,
+            only the session ends: the attempt stays `IN_PROGRESS`, its session
+            time is banked as `total_time`, and the next start resumes it.
+        seq:
+          type: integer
+          minimum: 0
+          description: |
+            Optional client commit sequence number (strictly increasing per
+            attempt). A commit whose `seq` is at or below the attempt's
+            `lastCommitSeq` is acknowledged with `duplicate: true` and not
+            re-applied, making retries after a dropped response safe.
+        recordedAt:
+          type: string
+          format: date-time
+          description: When the client recorded the commit, if it was queued offline.
 
     CommitResponse:
       type: object
-      required: [ok, terminated, errors, warnings, summary]
+      required: [ok, terminated, suspended, errors, warnings, summary]
       properties:
         ok:
           type: boolean
@@ -980,6 +2127,17 @@ components:
         terminated:
           type: boolean
           description: True when this commit finalized the attempt.
+        suspended:
+          type: boolean
+          description: |
+            True when a terminate with exit=suspend ended the session but left
+            the attempt open to resume.
+        duplicate:
+          type: boolean
+          description: |
+            True when the request's `seq` was at or below the attempt's
+            `lastCommitSeq`: the commit had already been applied and nothing
+            was written. `summary` reflects the current state.
         errors:
           type: array
           description: |
@@ -992,6 +2150,70 @@ components:
             Empty in strict mode. Use for observability, not retry logic.
           items: { $ref: '#/components/schemas/CommitIssue' }
         summary: { $ref: '#/components/schemas/RuntimeSummary' }
+
+    QueuedCommit:
+      type: object
+      required: [seq, values]
+      properties:
+        seq:
+          type: integer
+          minimum: 0
+          description: Client-assigned, strictly increasing per attempt.
+        values: { $ref: '#/components/schemas/CommitRequest/properties/values' }
+        terminate: { type: boolean, default: false }
+        recordedAt:
+          type: string
+          format: date-time
+          description: When the client originally recorded the commit.
+
+    SyncRequest:
+      type: object
+      required: [commits]
+      properties:
+        commits:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items: { $ref: '#/components/schemas/QueuedCommit' }
+
+    SyncCommitOutcome:
+      type: object
+      required: [seq, status, errors, warnings, terminated, suspended]
+      properties:
+        seq: { type: integer }
+        status:
+          type: string
+          enum: [applied, duplicate, conflict]
+          description: |
+            `applied`: persisted now. `duplicate`: already applied by an earlier
+            sync (safe to drop). `conflict`: the attempt was already finished,
+            so the commit can never apply (server state wins).
+        terminated: { type: boolean }
+        suspended: { type: boolean }
+        errors:
+          type: array
+          items: { $ref: '#/components/schemas/CommitIssue' }
+        warnings:
+          type: array
+          items: { $ref: '#/components/schemas/CommitIssue' }
+
+    SyncResponse:
+      type: object
+      required: [lastCommitSeq, results, summary]
+      properties:
+        lastCommitSeq:
+          type: integer
+          nullable: true
+          description: The attempt's highest applied `seq` after reconciliation.
+        results:
+          type: array
+          description: One outcome per submitted commit, in `seq` order.
+          items: { $ref: '#/components/schemas/SyncCommitOutcome' }
+        summary:
+          description: Rollup after the last applied or duplicate commit; null if every commit conflicted.
+          oneOf:
+            - $ref: '#/components/schemas/RuntimeSummary'
+            - type: 'null'
 
     CommitIssue:
       type: object
@@ -1064,3 +2286,587 @@ components:
         recentAttempts:
           type: array
           items: { $ref: '#/components/schemas/Attempt' }
+
+    # ── LRS / xAPI 1.0.3 ─────────────────────────────────────────────────
+    XapiAbout:
+      type: object
+      required: [version]
+      properties:
+        version:
+          type: array
+          items: { type: string }
+        extensions:
+          type: object
+          additionalProperties: true
+
+    XapiLanguageMap:
+      type: object
+      description: RFC 5646 language tag → text.
+      additionalProperties: { type: string }
+
+    XapiAccount:
+      type: object
+      required: [homePage, name]
+      properties:
+        homePage: { type: string, format: iri }
+        name: { type: string }
+
+    XapiAgent:
+      type: object
+      description: |
+        An Agent carries exactly one inverse-functional identifier (`mbox`,
+        `mbox_sha1sum`, `openid` or `account`). A Group may carry none, in which
+        case it must list members and is identified by that member set.
+      properties:
+        objectType:
+          type: string
+          enum: [Agent, Group]
+        name: { type: string }
+        mbox: { type: string, format: mailto }
+        mbox_sha1sum: { type: string, pattern: '^[0-9a-fA-F]{40}$' }
+        openid: { type: string, format: iri }
+        account: { $ref: '#/components/schemas/XapiAccount' }
+        member:
+          type: array
+          description: Group members only.
+          items: { $ref: '#/components/schemas/XapiAgent' }
+
+    XapiPerson:
+      type: object
+      description: |
+        Everything this LRS knows about one agent. Unlike an Agent, each
+        identifying property is an *array* — the union of the values seen across
+        statements sharing that inverse-functional identifier.
+      required: [objectType]
+      properties:
+        objectType: { type: string, enum: [Person] }
+        name:
+          type: array
+          items: { type: string }
+        mbox:
+          type: array
+          items: { type: string, format: mailto }
+        mbox_sha1sum:
+          type: array
+          items: { type: string, pattern: '^[0-9a-fA-F]{40}$' }
+        openid:
+          type: array
+          items: { type: string, format: iri }
+        account:
+          type: array
+          items: { $ref: '#/components/schemas/XapiAccount' }
+
+    XapiVerb:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string, format: iri }
+        display: { $ref: '#/components/schemas/XapiLanguageMap' }
+
+    XapiActivity:
+      type: object
+      required: [id]
+      properties:
+        objectType: { type: string, enum: [Activity] }
+        id: { type: string, format: iri }
+        definition:
+          type: object
+          additionalProperties: true
+
+    XapiStatementRef:
+      type: object
+      required: [objectType, id]
+      properties:
+        objectType: { type: string, enum: [StatementRef] }
+        id: { type: string, format: uuid }
+
+    XapiScore:
+      type: object
+      properties:
+        scaled: { type: number, minimum: -1, maximum: 1 }
+        raw: { type: number }
+        min: { type: number }
+        max: { type: number }
+
+    XapiResult:
+      type: object
+      properties:
+        score: { $ref: '#/components/schemas/XapiScore' }
+        success: { type: boolean }
+        completion: { type: boolean }
+        response: { type: string }
+        duration:
+          type: string
+          description: ISO 8601 duration, e.g. `PT1H30M`.
+        extensions:
+          type: object
+          additionalProperties: true
+
+    XapiContext:
+      type: object
+      properties:
+        registration: { type: string, format: uuid }
+        instructor: { $ref: '#/components/schemas/XapiAgent' }
+        team: { $ref: '#/components/schemas/XapiAgent' }
+        contextActivities:
+          type: object
+          additionalProperties: true
+        revision:
+          type: string
+          description: Only allowed when the object is an Activity.
+        platform:
+          type: string
+          description: Only allowed when the object is an Activity.
+        language: { type: string }
+        statement: { $ref: '#/components/schemas/XapiStatementRef' }
+        extensions:
+          type: object
+          additionalProperties: true
+
+    XapiStatement:
+      type: object
+      required: [actor, verb, object]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Assigned by the LRS when omitted.
+        actor: { $ref: '#/components/schemas/XapiAgent' }
+        verb: { $ref: '#/components/schemas/XapiVerb' }
+        object:
+          description: An Activity, Agent, Group, StatementRef or SubStatement.
+          oneOf:
+            - $ref: '#/components/schemas/XapiActivity'
+            - $ref: '#/components/schemas/XapiAgent'
+            - $ref: '#/components/schemas/XapiStatementRef'
+            - type: object
+              additionalProperties: true
+        result: { $ref: '#/components/schemas/XapiResult' }
+        context: { $ref: '#/components/schemas/XapiContext' }
+        timestamp:
+          type: string
+          format: date-time
+          description: Defaults to the time of storage.
+        stored:
+          type: string
+          format: date-time
+          readOnly: true
+        authority:
+          allOf: [{ $ref: '#/components/schemas/XapiAgent' }]
+          readOnly: true
+          description: Always overwritten by the LRS with an agent identifying this tenant.
+        version:
+          type: string
+          readOnly: true
+        attachments:
+          type: array
+          items: { $ref: '#/components/schemas/XapiAttachment' }
+
+    XapiAttachment:
+      type: object
+      required: [usageType, display, contentType, length, sha2]
+      properties:
+        usageType:
+          type: string
+          format: iri
+          description: Use `http://adlnet.gov/expapi/attachments/signature` for a JWS statement signature.
+        display:
+          type: object
+          additionalProperties: { type: string }
+        description:
+          type: object
+          additionalProperties: { type: string }
+        contentType: { type: string }
+        length: { type: integer, minimum: 0 }
+        sha2:
+          type: string
+          description: Hex SHA-2 digest of the body; matches the part's `X-Experience-API-Hash`.
+        fileUrl:
+          type: string
+          format: iri
+          description: Where the body can be fetched; when set, the body need not be uploaded.
+
+    XapiStatementResult:
+      type: object
+      required: [statements, more]
+      properties:
+        statements:
+          type: array
+          items: { $ref: '#/components/schemas/XapiStatement' }
+        more:
+          type: string
+          description: Relative URL of the next page, or an empty string when the result set is exhausted.
+
+    # ── Webhooks ─────────────────────────────────────────────────────────
+    WebhookEventType:
+      type: string
+      enum:
+        - attempt.started
+        - attempt.suspended
+        - attempt.terminated
+        - course.completed
+        - course.passed
+        - course.failed
+        - score.updated
+        - objective.mastered
+        - cmi5.session.terminated
+        - cmi5.session.abandoned
+        - cmi5.au.waived
+        - cmi5.block.satisfied
+        - cmi5.course.satisfied
+        - xapi.statement.stored
+        - webhook.test
+
+    WebhookEndpoint:
+      type: object
+      required: [id, url, description, events, enabled, createdAt, updatedAt]
+      properties:
+        id: { type: string }
+        url: { type: string, format: uri }
+        description: { type: [string, 'null'] }
+        events:
+          type: array
+          description: Subscribed event types, or `["*"]` for all.
+          items: { type: string }
+        enabled: { type: boolean }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    WebhookEndpointWithSecret:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEndpoint'
+        - type: object
+          required: [secret]
+          properties:
+            secret:
+              type: string
+              description: HMAC-SHA256 signing secret. Store it; it is not shown again.
+              example: whsec_3kq9…
+
+    WebhookEndpointCreate:
+      type: object
+      required: [url, events]
+      properties:
+        url:
+          type: string
+          format: uri
+          description: http(s) URL. Private / loopback addresses are refused unless `WEBHOOK_ALLOW_PRIVATE_URLS` is set.
+        events:
+          type: array
+          minItems: 1
+          description: Event types (see `WebhookEventType`), or `*` for all.
+          items: { type: string }
+        description: { type: [string, 'null'], maxLength: 500 }
+        enabled: { type: boolean, default: true }
+
+    WebhookEndpointUpdate:
+      type: object
+      properties:
+        url: { type: string, format: uri }
+        events:
+          type: array
+          minItems: 1
+          items: { type: string }
+        description: { type: [string, 'null'], maxLength: 500 }
+        enabled: { type: boolean }
+
+    WebhookDeliveryStatus:
+      type: string
+      enum: [PENDING, SUCCEEDED, FAILED]
+      description: '`FAILED` is the dead-letter state: out of retries until retried by hand.'
+
+    WebhookPayload:
+      type: object
+      required: [id, type, createdAt, data]
+      description: The JSON body of every delivery.
+      properties:
+        id:
+          type: string
+          description: Event id, the same on every endpoint's copy and every retry. Dedupe on it.
+        type: { $ref: '#/components/schemas/WebhookEventType' }
+        createdAt: { type: string, format: date-time }
+        data:
+          type: object
+          additionalProperties: true
+          description: |
+            Event-specific. Attempt events carry `attemptId`, `courseId`, `scoId`,
+            `learnerId`, `completionStatus`, `successStatus`, `score` and
+            `totalTimeSeconds`; cmi5 events carry `registrationId`, `courseId`,
+            `actor`, and the `au` or `block` concerned.
+
+    WebhookDelivery:
+      type: object
+      required:
+        - id
+        - endpointId
+        - eventId
+        - eventType
+        - status
+        - attempts
+        - nextAttemptAt
+        - lastAttemptAt
+        - lastStatusCode
+        - lastError
+        - lastResponse
+        - deliveredAt
+        - createdAt
+        - payload
+      properties:
+        id: { type: string }
+        endpointId: { type: string }
+        eventId: { type: string }
+        eventType: { type: string }
+        status: { $ref: '#/components/schemas/WebhookDeliveryStatus' }
+        attempts: { type: integer }
+        nextAttemptAt: { type: [string, 'null'], format: date-time }
+        lastAttemptAt: { type: [string, 'null'], format: date-time }
+        lastStatusCode: { type: [integer, 'null'] }
+        lastError: { type: [string, 'null'] }
+        lastResponse:
+          type: [string, 'null']
+          description: Start of the receiver's last response body.
+        deliveredAt: { type: [string, 'null'], format: date-time }
+        createdAt: { type: string, format: date-time }
+        payload: { $ref: '#/components/schemas/WebhookPayload' }
+
+    # ── cmi5 ─────────────────────────────────────────────────────────────
+    Cmi5MoveOn:
+      type: string
+      enum: [Passed, Completed, CompletedAndPassed, CompletedOrPassed, NotApplicable]
+
+    Cmi5LaunchMode:
+      type: string
+      enum: [Normal, Browse, Review]
+
+    Cmi5Au:
+      type: object
+      required: [id, publisherId, activityId, title, url, launchMethod, moveOn]
+      properties:
+        id: { type: string, description: Engine id of the AU. }
+        publisherId:
+          type: string
+          description: AU id from the course structure (the publisher's IRI).
+        activityId:
+          type: string
+          description: Engine-generated activity IRI; the object of every cmi5 defined statement for this AU.
+        title: { type: string }
+        description: { type: [string, 'null'] }
+        url:
+          type: string
+          description: AU url as declared — relative to the package root, or absolute.
+        launchMethod: { type: string, enum: [AnyWindow, OwnWindow] }
+        moveOn: { $ref: '#/components/schemas/Cmi5MoveOn' }
+        masteryScore: { type: [number, 'null'], minimum: 0, maximum: 1 }
+        activityType: { type: [string, 'null'] }
+        launchParameters: { type: [string, 'null'] }
+
+    Cmi5StructureNode:
+      type: object
+      required: [type, id]
+      description: An AU reference or a block, in course order. Blocks nest further nodes.
+      properties:
+        type: { type: string, enum: [au, block] }
+        id: { type: string, description: Publisher id of the AU or block. }
+        activityId:
+          type: string
+          description: Blocks only — engine-generated activity IRI, the object of the block's `satisfied` statement.
+        title: { type: string }
+        description: { type: [string, 'null'] }
+        children:
+          type: array
+          items: { $ref: '#/components/schemas/Cmi5StructureNode' }
+
+    Cmi5Course:
+      type: object
+      required: [id, publisherId, activityId, title, hosted, aus, structure, createdAt, updatedAt]
+      properties:
+        id: { type: string }
+        publisherId: { type: string, description: Course id from the course structure. }
+        activityId:
+          type: string
+          description: Engine-generated activity IRI used for course-level statements (`satisfied`).
+        title: { type: string }
+        description: { type: [string, 'null'] }
+        hosted:
+          type: boolean
+          description: True when the engine stores the package files; false for a structure-only import.
+        aus:
+          type: array
+          items: { $ref: '#/components/schemas/Cmi5Au' }
+        structure:
+          type: array
+          items: { $ref: '#/components/schemas/Cmi5StructureNode' }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    Cmi5CourseListResponse:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Cmi5Course' }
+        pagination: { $ref: '#/components/schemas/Pagination' }
+
+    Cmi5ValidationReport:
+      type: object
+      required: [valid, errors]
+      properties:
+        valid: { type: boolean }
+        errors:
+          type: array
+          items:
+            type: object
+            required: [code, message]
+            properties:
+              code: { type: string }
+              message: { type: string }
+        structure:
+          description: The parsed course structure, or null when invalid.
+          oneOf:
+            - type: object
+              additionalProperties: true
+            - type: 'null'
+
+    Cmi5RegistrationRequest:
+      type: object
+      required: [courseId]
+      description: Identify the learner with either a full `actor` or a `learnerId`.
+      properties:
+        courseId: { type: string }
+        actor: { $ref: '#/components/schemas/XapiAgent' }
+        learnerId:
+          type: string
+          description: Shorthand for an Agent account on `XAPI_AUTHORITY_HOMEPAGE`.
+        learnerName: { type: string }
+        learnerPreferences:
+          allOf: [{ $ref: '#/components/schemas/Cmi5LearnerPreferences' }]
+          description: Optional; replaces the learner's `cmi5LearnerPreferences` agent profile.
+
+    Cmi5LearnerPreferences:
+      type: object
+      description: The `cmi5LearnerPreferences` Agent Profile document AUs read from the LRS.
+      properties:
+        languagePreference:
+          type: string
+          description: Comma-separated RFC 5646 language codes, most preferred first.
+          example: fr-FR,en-US
+        audioPreference: { type: string, enum: ['on', 'off'] }
+
+    Cmi5LearnerPreferencesRequest:
+      description: Identify the learner with either a full `actor` or a `learnerId`. Replaces the stored document.
+      allOf:
+        - $ref: '#/components/schemas/Cmi5LearnerPreferences'
+        - type: object
+          properties:
+            actor: { $ref: '#/components/schemas/XapiAgent' }
+            learnerId: { type: string }
+            learnerName: { type: string }
+
+    Cmi5BlockProgress:
+      type: object
+      required: [publisherId, title, satisfied, satisfiedAt]
+      properties:
+        publisherId: { type: string }
+        title: { type: string }
+        satisfied:
+          type: boolean
+          description: True once every AU and nested block in it is satisfied; the engine then records `satisfied` for the block.
+        satisfiedAt: { type: [string, 'null'], format: date-time }
+
+    Cmi5AuProgress:
+      type: object
+      required: [id, publisherId, title, moveOn, completed, passed, failed, waived, satisfied]
+      properties:
+        id: { type: string }
+        publisherId: { type: string }
+        title: { type: string }
+        moveOn: { $ref: '#/components/schemas/Cmi5MoveOn' }
+        completed: { type: boolean }
+        passed: { type: boolean }
+        failed: { type: boolean }
+        waived: { type: boolean }
+        satisfied:
+          type: boolean
+          description: Whether the AU's moveOn criterion is met.
+
+    Cmi5Registration:
+      type: object
+      required: [id, courseId, actor, satisfied, satisfiedAt, createdAt, aus, blocks]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: The xAPI `registration` every statement in this enrolment carries.
+        courseId: { type: string }
+        actor: { $ref: '#/components/schemas/XapiAgent' }
+        satisfied:
+          type: boolean
+          description: True once every AU's moveOn criterion is met; the engine then records `satisfied` for the course.
+        satisfiedAt: { type: [string, 'null'], format: date-time }
+        createdAt: { type: string, format: date-time }
+        aus:
+          type: array
+          items: { $ref: '#/components/schemas/Cmi5AuProgress' }
+        blocks:
+          type: array
+          description: Every block in the course, in document order.
+          items: { $ref: '#/components/schemas/Cmi5BlockProgress' }
+
+    Cmi5LaunchRequest:
+      type: object
+      required: [auId]
+      properties:
+        auId:
+          type: string
+          description: Engine id or publisher id of the AU.
+        launchMode:
+          allOf: [{ $ref: '#/components/schemas/Cmi5LaunchMode' }]
+          default: Normal
+        returnUrl:
+          type: string
+          format: uri
+          description: Written to LaunchData as `returnURL`.
+
+    Cmi5LaunchResponse:
+      type: object
+      required: [url, sessionId, launchMode, launchMethod, expiresAt]
+      properties:
+        url:
+          type: string
+          format: uri
+          description: |
+            The AU launch URL, carrying `endpoint`, `fetch`, `actor`, `registration`
+            and `activityId`. Open it in a new window when `launchMethod` is
+            `OwnWindow`; otherwise an iframe works too.
+        sessionId: { type: string, format: uuid }
+        launchMode: { $ref: '#/components/schemas/Cmi5LaunchMode' }
+        launchMethod: { type: string, enum: [AnyWindow, OwnWindow] }
+        expiresAt: { type: string, format: date-time }
+
+    Cmi5WaiveRequest:
+      type: object
+      required: [auId, reason]
+      properties:
+        auId: { type: string }
+        reason:
+          type: string
+          enum: [Tested Out, Equivalent AU, Equivalent Outside Activity, Administrative]
+
+    Cmi5FetchResponse:
+      type: object
+      required: [auth-token]
+      properties:
+        auth-token:
+          type: string
+          description: 'Send as `Authorization: Basic <auth-token>` on every LRS call.'
+
+    Cmi5FetchError:
+      type: object
+      required: [error-code, error-text]
+      properties:
+        error-code:
+          type: string
+          enum: ['1', '2', '3']
+          description: '`1` already redeemed, `2` invalid or expired, `3` general error.'
+        error-text: { type: string }
