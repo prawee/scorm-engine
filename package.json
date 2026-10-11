@@ -1,6 +1,6 @@
 {
   "name": "@scormflow/server",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Headless SCORM, xAPI, and cmi5 engine with built-in LRS, webhooks, and AI analytics. Embed in Node or run via Docker.",
   "license": "MIT",
   "type": "module",
