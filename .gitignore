@@ -32,3 +32,4 @@ NOTES.md
 docs/internal/
 .claude/
 
+docker/data/*
