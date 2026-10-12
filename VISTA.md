@@ -55,15 +55,16 @@ docker compose -f docker/redis.yml up -d
 ### ขั้นตอนที่ 4: Migrate Database Schema
 ติดตั้ง dependencies และซิงค์โครงสร้างฐานข้อมูลผ่าน Prisma:
 ```bash
-npm install
-npm run db:migrate
-# หรือใช้ npx prisma db push หากยังไม่มี migration files
+pnpm install
+# หรือซิงค์ schema โดยตรง
+pnpm exec prisma db push
 ```
 
 ### ขั้นตอนที่ 5: เริ่มต้นรัน Engine (Dev Server)
 รัน SCORM Engine ในโหมด Development (Hot Reload ผ่าน tsx):
 ```bash
-npm run dev
+pnpm dev
+# หรือ npm run dev
 ```
 Engine จะพร้อมใช้งานที่ `http://localhost:3000`
 

@@ -85,7 +85,7 @@ const baseSchema = z.object({
   S3_SESSION_TOKEN: emptyAsUndefined(z.string().optional()),
   S3_FORCE_PATH_STYLE: boolish.default(false),
 
-  REDIS_URL: z.string().url().optional(),
+  REDIS_URL: emptyAsUndefined(z.string().url().optional()),
 });
 
 const envSchema = baseSchema.superRefine((env, ctx) => {
